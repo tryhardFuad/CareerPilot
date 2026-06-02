@@ -4,6 +4,7 @@
 /node_modules
 /.pnp
 .pnp.js
+.puku/
 
 # testing
 /coverage
@@ -34,3 +35,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# editor
+.idea/
+.vscode/
