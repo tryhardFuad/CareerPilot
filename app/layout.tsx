@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Inter, Roboto } from "next/font/google";
+import { ClerkProvider, SignInButton, SignUpButton, Show, UserButton } from "@clerk/nextjs";
 import "./globals.css";
 
 const inter = Inter({
@@ -36,10 +37,39 @@ export default function RootLayout({
   children,
 }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="en" className={`${inter.variable} ${roboto.variable}`}>
-      <body className="min-h-screen bg-background font-body text-secondary antialiased">
-        {children}
-      </body>
-    </html>
+    <ClerkProvider>
+      <html lang="en" className={`${inter.variable} ${roboto.variable}`}>
+        <body className="min-h-screen bg-background font-body text-secondary antialiased">
+          <header className="flex items-center justify-end gap-2 border-b border-secondary-100 bg-white px-6 py-3">
+            <Show when="signed-out">
+              <SignInButton mode="modal">
+                <button
+                  type="button"
+                  className="rounded-lg px-3 py-1.5 text-sm font-semibold text-secondary hover:text-primary"
+                >
+                  Sign in
+                </button>
+              </SignInButton>
+              <SignUpButton mode="modal">
+                <button
+                  type="button"
+                  className="rounded-lg bg-primary px-3 py-1.5 text-sm font-semibold text-white shadow-card transition hover:bg-primary-600"
+                >
+                  Get started
+                </button>
+              </SignUpButton>
+            </Show>
+            <Show when="signed-in">
+              <UserButton
+                appearance={{
+                  elements: { avatarBox: "h-8 w-8" },
+                }}
+              />
+            </Show>
+          </header>
+          {children}
+        </body>
+      </html>
+    </ClerkProvider>
   );
 }

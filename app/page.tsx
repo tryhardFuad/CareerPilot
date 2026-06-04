@@ -1,5 +1,5 @@
 import Link from "next/link";
-import type { Route } from "next";
+import { SignInButton, SignUpButton } from "@clerk/nextjs";
 import {
   Sparkles,
   Target,
@@ -77,27 +77,25 @@ function Header() {
         <Link href="#pillars" className="text-sm font-medium text-secondary-600 hover:text-primary">
           Features
         </Link>
-        <Link href="/pricing" className="text-sm font-medium text-secondary-600 hover:text-primary">
-          Pricing
-        </Link>
-        <Link href="/about" className="text-sm font-medium text-secondary-600 hover:text-primary">
-          About
-        </Link>
       </nav>
       <div className="flex items-center gap-3">
-        <Link
-          href={"/sign-in" as Route}
-          className="hidden text-sm font-medium text-secondary-600 hover:text-primary sm:inline-block"
-        >
-          Sign in
-        </Link>
-        <Link
-          href={"/sign-up" as Route}
-          className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-white shadow-card transition hover:bg-primary-600"
-        >
-          Get Started
-          <ArrowRight className="h-4 w-4" />
-        </Link>
+        <SignInButton mode="modal">
+          <button
+            type="button"
+            className="hidden text-sm font-medium text-secondary-600 hover:text-primary sm:inline-block"
+          >
+            Sign in
+          </button>
+        </SignInButton>
+        <SignUpButton mode="modal">
+          <button
+            type="button"
+            className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-white shadow-card transition hover:bg-primary-600"
+          >
+            Get Started
+            <ArrowRight className="h-4 w-4" />
+          </button>
+        </SignUpButton>
       </div>
     </header>
   );
@@ -109,7 +107,7 @@ function Hero() {
       <div className="mx-auto max-w-3xl text-center">
         <span className="inline-flex items-center gap-1.5 rounded-full border border-primary-100 bg-primary-50 px-3 py-1 text-xs font-semibold text-primary">
           <Sparkles className="h-3 w-3" />
-          For Dhaka founders &amp; job seekers
+          For ambitious job seekers
         </span>
         <h1 className="font-heading mt-6 text-balance text-4xl font-extrabold tracking-tight md:text-6xl">
           {heroHeadlines[0]}
@@ -120,13 +118,15 @@ function Hero() {
           so you can focus on closing offers.
         </p>
         <div className="mt-8 flex flex-col items-center justify-center gap-3 sm:flex-row">
-          <Link
-            href={"/sign-up" as Route}
-            className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-primary px-6 py-3 text-base font-semibold text-white shadow-card transition hover:bg-primary-600 hover:shadow-cardHover sm:w-auto"
-          >
-            Get Started
-            <ArrowRight className="h-4 w-4" />
-          </Link>
+          <SignUpButton mode="modal">
+            <button
+              type="button"
+              className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-primary px-6 py-3 text-base font-semibold text-white shadow-card transition hover:bg-primary-600 hover:shadow-cardHover sm:w-auto"
+            >
+              Get Started
+              <ArrowRight className="h-4 w-4" />
+            </button>
+          </SignUpButton>
           <Link
             href="#pillars"
             className="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-secondary-200 bg-white px-6 py-3 text-base font-semibold text-secondary transition hover:border-primary hover:text-primary sm:w-auto"
@@ -157,7 +157,7 @@ function Pillars() {
           Four pillars. One autopilot.
         </h2>
         <p className="text-pretty mt-4 text-secondary-500">
-          Built for the Dhaka founders ecosystem — every feature moves you
+          Built for ambitious job seekers — every feature moves you
           from searching to hired.
         </p>
       </div>
@@ -194,13 +194,15 @@ function ClosingCTA() {
         <p className="text-pretty mx-auto mt-4 max-w-xl text-white/85">
           Upload your CV. Get your roadmap. Let CareerPilot handle the hunt.
         </p>
-        <Link
-          href={"/sign-up" as Route}
-          className="mt-8 inline-flex items-center gap-2 rounded-lg bg-white px-6 py-3 text-base font-semibold text-primary shadow-card transition hover:bg-secondary-50"
-        >
-          Get Started
-          <ArrowRight className="h-4 w-4" />
-        </Link>
+        <SignUpButton mode="modal">
+          <button
+            type="button"
+            className="mt-8 inline-flex items-center gap-2 rounded-lg bg-white px-6 py-3 text-base font-semibold text-primary shadow-card transition hover:bg-secondary-50"
+          >
+            Get Started
+            <ArrowRight className="h-4 w-4" />
+          </button>
+        </SignUpButton>
       </div>
     </section>
   );
@@ -212,8 +214,7 @@ function Footer() {
       <div className="container-wide flex flex-col items-center justify-between gap-4 py-8 text-sm text-secondary-500 md:flex-row">
         <p>© {new Date().getFullYear()} CareerPilot. All rights reserved.</p>
         <p>
-          Built for the{" "}
-          <span className="font-semibold text-primary">Dhaka Founders</span> ecosystem.
+          Built for ambitious job seekers, by CareerPilot.
         </p>
       </div>
     </footer>

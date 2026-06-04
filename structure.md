@@ -3,9 +3,6 @@ careerpilot/
 │   ├── layout.tsx                    # Root: Inter + Roboto, ClerkProvider, QueryProvider
 │   ├── globals.css                   # Tailwind v4 + brand tokens
 │   ├── page.tsx                      # Marketing landing (hero w/ brand-dna headlines)
-│   ├── (marketing)/
-│   │   ├── pricing/page.tsx
-│   │   └── about/page.tsx
 │   ├── (auth)/
 │   │   ├── sign-in/[[...sign-in]]/page.tsx
 │   │   └── sign-up/[[...sign-up]]/page.tsx
