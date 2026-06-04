@@ -17,7 +17,7 @@ const sample = {
     { company: "Sheba.xyz", role: "Engineering Manager" },
   ],
   offer: [
-    { company: "Dhaka Founders Studio", role: "Founding Engineer" },
+    { company: "CareerPilot Labs", role: "Founding Engineer" },
   ],
   rejected: [],
 } as const;

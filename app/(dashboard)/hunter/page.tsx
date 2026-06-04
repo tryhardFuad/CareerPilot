@@ -4,7 +4,7 @@ const sampleJobs = [
   {
     title: "Senior Full-Stack Engineer",
     company: "Pathao",
-    location: "Dhaka (Hybrid)",
+    location: "Bangalore (Hybrid)",
     type: "Full-time",
     snippet:
       "Own end-to-end product features across our super-app stack (Node, React, Go).",
@@ -12,14 +12,14 @@ const sampleJobs = [
   {
     title: "Product Engineer, Fintech",
     company: "bKash",
-    location: "Dhaka (On-site)",
+    location: "Singapore (On-site)",
     type: "Full-time",
     snippet:
       "Build payment rails used by 50M+ users. Strong TypeScript + Postgres preferred.",
   },
   {
     title: "Founding Engineer",
-    company: "Dhaka Founders Studio",
+    company: "CareerPilot Labs",
     location: "Remote",
     type: "Contract",
     snippet:
