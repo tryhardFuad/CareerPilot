@@ -70,35 +70,63 @@ export function isRateLimitError(err: unknown): boolean {
  */
 export function extractRetryAfterMs(err: unknown): number | undefined {
   if (!err) return undefined;
-  // Walk the error's `.details` / `.error.details` chain where the SDK nests
-  // the structured RpcViolation / RetryInfo objects.
-  const visit = (v: unknown): number | undefined => {
-    if (!v || typeof v !== "object") return undefined;
-    const obj = v as Record<string, unknown>;
-    if (typeof obj.retryDelay === "string") {
-      const m = obj.retryDelay.match(/^(\d+(?:\.\d+)?)\s*(s|ms)?$/i);
-      if (m && m[1] !== undefined) {
-        const n = parseFloat(m[1]);
-        if (!Number.isFinite(n)) return undefined;
-        const unit = (m[2] ?? "s").toLowerCase();
-        return unit === "s" ? Math.ceil(n * 1000) : Math.ceil(n);
-      }
+  const parseDelay = (s: string): number | undefined => {
+    const m = s.match(/^(\d+(?:\.\d+)?)\s*(s|ms)?$/i);
+    if (m && m[1] !== undefined) {
+      const n = parseFloat(m[1]);
+      if (!Number.isFinite(n)) return undefined;
+      const unit = (m[2] ?? "s").toLowerCase();
+      return unit === "s" ? Math.ceil(n * 1000) : Math.ceil(n);
     }
-    // Some SDKs put the structured payload under `@type` markers; if we
-    // see a `@type` of type.googleapis.com/google.rpc.RetryInfo, descend.
-    if (typeof obj["@type"] === "string" && Array.isArray(obj.details)) {
-      for (const d of obj.details) {
-        const found = visit(d);
+    return undefined;
+  };
+  // Walk the error's nested structure. The Gemini SDK puts the JSON body
+  // on `errorDetails` (v0.x) or `error.details` (v1+); the body itself is
+  // `{ error: { code, message, status, details: [{@type, ...}] } }`.
+  // RetryInfo lives at `details[*].retryDelay` alongside QuotaFailure and
+  // Help entries.
+  const visit = (v: unknown, depth = 0): number | undefined => {
+    if (!v || typeof v !== "object" || depth > 6) return undefined;
+    const obj = v as Record<string, unknown>;
+    // Direct retryDelay on this object
+    if (typeof obj.retryDelay === "string") {
+      const parsed = parseDelay(obj.retryDelay);
+      if (parsed !== undefined) return parsed;
+    }
+    // The SDK's own field that carries the parsed body
+    if (Array.isArray(obj.errorDetails)) {
+      for (const d of obj.errorDetails) {
+        const found = visit(d, depth + 1);
         if (found !== undefined) return found;
       }
     }
+    // Standard google.rpc error envelope
     if (Array.isArray(obj.details)) {
       for (const d of obj.details) {
-        const found = visit(d);
+        const found = visit(d, depth + 1);
         if (found !== undefined) return found;
       }
     }
-    if (obj.error) return visit(obj.error);
+    // QuotaFailure.violations[*] occasionally also carry retry hints
+    if (Array.isArray(obj.violations)) {
+      for (const d of obj.violations) {
+        const found = visit(d, depth + 1);
+        if (found !== undefined) return found;
+      }
+    }
+    // Recurse into wrapped objects
+    if (obj.error) {
+      const found = visit(obj.error, depth + 1);
+      if (found !== undefined) return found;
+    }
+    if (obj.response && typeof obj.response === "object") {
+      const found = visit(obj.response, depth + 1);
+      if (found !== undefined) return found;
+    }
+    if (obj.body && typeof obj.body === "object") {
+      const found = visit(obj.body, depth + 1);
+      if (found !== undefined) return found;
+    }
     return undefined;
   };
   return visit(err);
@@ -107,13 +135,18 @@ export function extractRetryAfterMs(err: unknown): number | undefined {
 export type BackoffOpts = {
   maxAttempts?: number;   // total attempts including the first (default 3)
   baseMs?: number;        // first backoff window (default 500ms)
-  capMs?: number;         // ceiling for any single backoff (default 8000ms)
+  capMs?: number;         // ceiling for any single backoff (default 60000ms)
 };
 
 /**
  * Exponential backoff with full jitter. Returns the first successful value
  * or throws the last error (wrapped in RetryableError when it was a rate-limit
  * error, so the caller / circuit breaker can recognise it).
+ *
+ * If the rate-limit error includes a structured `retryDelay` (Gemini's
+ * `RetryInfo`), we honour that exact duration, capped at `capMs`. The
+ * default `capMs` is 60s so server hints up to a minute are respected
+ * instead of being silently clipped to 8s.
  */
 export async function withBackoff<T>(
   fn: () => Promise<T>,
@@ -121,7 +154,7 @@ export async function withBackoff<T>(
 ): Promise<T> {
   const maxAttempts = Math.max(1, opts.maxAttempts ?? 3);
   const baseMs = opts.baseMs ?? 500;
-  const capMs = opts.capMs ?? 8_000;
+  const capMs = opts.capMs ?? 60_000;
 
   let lastErr: unknown;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {

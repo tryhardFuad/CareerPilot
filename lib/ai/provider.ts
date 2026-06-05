@@ -163,15 +163,19 @@ export async function embedText(
  * Gemini embedding quotas (free tier):
  *   - `batchEmbedContents` request body: max 100 entries
  *   - `embed_content_free_tier_requests`: 100 per minute per model per project
+ *   - Project-level (`EmbedContentRequestsPerMinutePerProjectPerModel`): a
+ *     tighter hidden bucket that gets tripped faster than the per-model one
+ *     once any code path is also doing chat / fit-score calls in the same
+ *     minute. We treat that as the binding constraint.
  *
  * The SDK counts each `text` inside a batched call against the per-minute
  * quota, so a sub-batch of 100 burns the whole minute's budget in one go.
- * We size sub-batches at 30 (well under both caps) and pace them with a
- * 1.2s gap so consecutive sub-batches never co-occupy the same minute
- * window. A 250-chunk CV needs ~9 sub-batches × (latency + 1.2s) ≈ 12s.
+ * We size sub-batches at 20 (extra headroom) and pace them with a 2.5s gap
+ * so a 250-chunk CV (~13 sub-batches) spreads across ~32s of wall time.
+ * Peak sub-batch rate = 0.4/s, well under the project-level cap.
  */
-const MAX_BATCH_SIZE = 30;
-const INTER_SUB_BATCH_MS = 1_200;
+const MAX_BATCH_SIZE = 20;
+const INTER_SUB_BATCH_MS = 2_500;
 
 /**
  * Embed many texts in one round trip. Used by the CV ingester to amortise
@@ -206,15 +210,15 @@ export async function embedBatch(
   for (let i = 0; i < allRequests.length; i += MAX_BATCH_SIZE) {
     if (i > 0) {
       // Pace sub-batches so we don't fire 3 back-to-back sub-calls into the
-      // same per-minute window. INTER_SUB_BATCH_MS is intentionally > 1.2s
-      // even on small CVs to keep the worst-case rate under the 100/min cap.
+      // same per-minute window. INTER_SUB_BATCH_MS keeps the worst-case rate
+      // comfortably under the project-level RPM cap.
       await new Promise((r) => setTimeout(r, INTER_SUB_BATCH_MS));
     }
     const slice = allRequests.slice(i, i + MAX_BATCH_SIZE);
     const result = await geminiBreaker().run(() =>
       withBackoff(
         () => model.batchEmbedContents({ requests: slice }),
-        { maxAttempts: 3, baseMs: 1_000, capMs: 30_000 },
+        { maxAttempts: 5, baseMs: 1_000, capMs: 60_000 },
       ),
     );
     result.embeddings.forEach((e, j) => {
