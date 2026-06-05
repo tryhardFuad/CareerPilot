@@ -44,10 +44,17 @@ import {
 
 export interface FitScoreInput {
   userId: string;
-  /** Raw JD text. Required if no benchmarkKey. */
+  /** Raw JD text. Required if no benchmarkKey and no benchmark. */
   jd?: string;
   /** Benchmark key from lib/data/benchmarks. Optional. */
   benchmarkKey?: string;
+  /**
+   * Inline benchmark (e.g. one synthesised at runtime from a free-text role).
+   * Takes precedence over `benchmarkKey` when both are set. The engine still
+   * uses the same scoring logic — the inline object just skips the registry
+   * lookup so dynamic benchmarks don't have to live in `BENCHMARKS`.
+   */
+  benchmark?: RoleBenchmark;
 }
 
 export interface ScoredSkill {
@@ -225,6 +232,7 @@ async function generateRationale(
     const raw = await chatComplete(
       [{ role: "user", parts: prompt }],
       {
+        tier: "quality",
         generationConfig: {
           temperature: 0.4,
           maxOutputTokens: 256,
@@ -245,14 +253,19 @@ async function generateRationale(
 // ---------- Main entry point ----------
 
 export async function scoreFitScore(input: FitScoreInput): Promise<FitScoreResult> {
-  const { userId, jd, benchmarkKey } = input;
-  if (!jd && !benchmarkKey) {
-    throw new Error("scoreFitScore requires either jd or benchmarkKey");
+  const { userId, jd, benchmarkKey, benchmark: inlineBenchmark } = input;
+  if (!jd && !benchmarkKey && !inlineBenchmark) {
+    throw new Error("scoreFitScore requires either jd, benchmarkKey, or benchmark");
   }
 
-  const benchmark: RoleBenchmark | null = benchmarkKey
-    ? getBenchmark(benchmarkKey)
-    : null;
+  // Inline benchmark wins (used by the dynamic synthesiser). Otherwise fall
+  // back to the static registry. `getBenchmark` throws on unknown keys — we
+  // surface that to the caller, who should have validated first.
+  const benchmark: RoleBenchmark | null = inlineBenchmark
+    ? inlineBenchmark
+    : benchmarkKey
+      ? getBenchmark(benchmarkKey)
+      : null;
 
   // 1. Pull CV evidence. Query is the JD (if present) or benchmark summary.
   const queryForRetrieval = jd ?? benchmark?.summary ?? "career experience";

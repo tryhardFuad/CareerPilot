@@ -1,7 +1,19 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Send, Sparkles, Bot, Plus, Trash2, Loader2 } from "lucide-react";
+import {
+  Send,
+  Sparkles,
+  Bot,
+  Plus,
+  Trash2,
+  Loader2,
+  Compass,
+  Target,
+  CalendarRange,
+  Mail,
+  ChevronDown,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 
 // ---------- Types ----------
@@ -20,12 +32,47 @@ interface Citation {
   score: number;
 }
 
+type AssistantMode = "readiness" | "gap_analysis" | "roadmap" | "cover_letter" | "general";
+
+interface ScoredSkill {
+  skill: string;
+  level: "none" | "beginner" | "intermediate" | "advanced";
+  evidence?: string;
+}
+
+interface FitScoreResult {
+  band: "strong" | "moderate" | "weak";
+  label: string;
+  score: number;
+}
+
+type StructuredPayload = 
+  | { kind: "readiness"; benchmarkTitle: string; overall: FitScoreResult; summary: string; buckets: { id: string; label: string; score: FitScoreResult; rationale: string }[] }
+  | { kind: "gap_analysis"; benchmarkTitle: string; overall: FitScoreResult; summary: string; missing: { skill: string; priority: 1 | 2 | 3 | 4 | 5; reason: string; evidence?: string }[] }
+  | { kind: "roadmap"; benchmarkTitle: string; weeks: number; overall: FitScoreResult; summary: string; weeks_plan: { week: number; focus: string; tasks: string[] }[] }
+  | { kind: "cover_letter"; benchmarkTitle: string; company?: string; tone: "professional" | "friendly" | "enthusiastic"; summary: string; body: string };
+
 interface Message {
   id?: string;
   role: "user" | "model";
   content: string;
+  mode?: AssistantMode;
+  structured?: StructuredPayload | null;
   citations?: Citation[] | null;
 }
+
+interface BenchmarkOption {
+  key: string;
+  title: string;
+  blurb: string;
+}
+
+const BENCHMARKS: BenchmarkOption[] = [
+  { key: "frontend_engineer", title: "Frontend Engineer", blurb: "React, Next.js, TypeScript, accessibility, modern styling." },
+  { key: "backend_engineer", title: "Backend Engineer", blurb: "APIs, databases, queues, observability, system design." },
+  { key: "data_analyst", title: "Data Analyst", blurb: "SQL, dashboards, stakeholder storytelling, business KPIs." },
+  { key: "product_manager", title: "Product Manager", blurb: "Discovery, prioritisation, experimentation, cross-functional work." },
+];
 
 // ---------- Page ----------
 
@@ -37,6 +84,18 @@ export default function ChatPage() {
   const [loading, setLoading] = useState(false);
   const [sidebarLoading, setSidebarLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [activeChip, setActiveChip] = useState<AssistantMode>("readiness");
+  /**
+   * The chip-panel "target role" is now a free-text input. The user can
+   * either type a curated role (autocompleted from BENCHMARKS) or any
+   * custom role they want. The string is matched case-insensitively
+   * against BENCHMARKS first; if no match, the dynamic synthesiser
+   * builds a RoleBenchmark from the free text.
+   */
+  const [chipRole, setChipRole] = useState<string>(BENCHMARKS[0]?.title ?? "");
+  const [chipWeeks, setChipWeeks] = useState<number>(4);
+  const [chipTone, setChipTone] = useState<"professional" | "friendly" | "enthusiastic">("professional");
+  const [chipCompany, setChipCompany] = useState<string>("");
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
   // Initial load: list threads. If none, create one.
@@ -45,7 +104,7 @@ export default function ChatPage() {
     (async () => {
       try {
         const res = await fetch("/api/chat/threads", { cache: "no-store" });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) throw new Error("HTTP " + res.status);
         const json = (await res.json()) as { threads: Thread[] };
         if (cancelled) return;
         const first = json.threads[0];
@@ -75,10 +134,10 @@ export default function ChatPage() {
     let cancelled = false;
     (async () => {
       try {
-        const res = await fetch(`/api/chat/threads/${activeId}`, { cache: "no-store" });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const res = await fetch("/api/chat/threads/" + activeId, { cache: "no-store" });
+        if (!res.ok) throw new Error("HTTP " + res.status);
         const json = (await res.json()) as { messages: Message[] };
-        if (!cancelled) setMessages(json.messages ?? []);
+        if (cancelled) setMessages(json.messages ?? []);
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : "Failed to load");
       }
@@ -101,7 +160,7 @@ export default function ChatPage() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({}),
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) throw new Error("HTTP " + res.status);
       const json = (await res.json()) as { thread: Thread };
       setThreads((prev) => [json.thread, ...prev]);
       setActiveId(json.thread.id);
@@ -116,8 +175,8 @@ export default function ChatPage() {
   const deleteThread = useCallback(
     async (id: string) => {
       try {
-        const res = await fetch(`/api/chat/threads/${id}`, { method: "DELETE" });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const res = await fetch("/api/chat/threads/" + id, { method: "DELETE" });
+        if (!res.ok) throw new Error("HTTP " + res.status);
         setThreads((prev) => prev.filter((t) => t.id !== id));
         if (activeId === id) {
           const next = threads.find((t) => t.id !== id);
@@ -131,31 +190,29 @@ export default function ChatPage() {
     [activeId, threads, createThread],
   );
 
-  const send = useCallback(
-    async (e: React.FormEvent) => {
-      e.preventDefault();
-      const text = input.trim();
-      if (!text || !activeId || loading) return;
-
+  const dispatch = useCallback(
+    async (args: { content: string; mode: AssistantMode; hints?: Record<string, unknown> }) => {
+      if (!activeId || loading) return;
       setError(null);
-      const userMsg: Message = { role: "user", content: text };
+      const userMsg: Message = { role: "user", content: args.content, mode: args.mode };
       setMessages((prev) => [...prev, userMsg]);
-      setInput("");
       setLoading(true);
-
       try {
-        const res = await fetch(`/api/chat/threads/${activeId}/messages`, {
+        const res = await fetch("/api/chat/threads/" + activeId + "/messages", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ content: text }),
+          body: JSON.stringify({
+            content: args.content,
+            intentHint: args.mode,
+            ...(args.hints ? { hints: args.hints } : {}),
+          }),
         });
         if (!res.ok) {
           const errJson = (await res.json().catch(() => ({}))) as { error?: string };
-          throw new Error(errJson.error ?? `HTTP ${res.status}`);
+          throw new Error(errJson.error ?? "HTTP " + res.status);
         }
         const json = (await res.json()) as { message: Message; citations: Citation[] };
         setMessages((prev) => [...prev, json.message]);
-        // Bump the thread to the top of the sidebar.
         setThreads((prev) =>
           prev.map((t) =>
             t.id === activeId
@@ -165,14 +222,73 @@ export default function ChatPage() {
         );
       } catch (err) {
         setError(err instanceof Error ? err.message : "Send failed");
-        // Remove the optimistic user message so the user can retry.
         setMessages((prev) => prev.slice(0, -1));
       } finally {
         setLoading(false);
       }
     },
-    [input, activeId, loading],
+    [activeId, loading],
   );
+
+  const send = useCallback(
+    async (e: React.FormEvent) => {
+      e.preventDefault();
+      const text = input.trim();
+      if (!text || !activeId || loading) return;
+      setInput("");
+      await dispatch({ content: text, mode: "general" });
+    },
+    [input, activeId, loading, dispatch],
+  );
+
+  const chipSubmit = useCallback(() => {
+    const roleText = chipRole.trim();
+    if (!roleText) return;
+    // Try to match a curated benchmark by title (case-insensitive).
+    const benchmark = BENCHMARKS.find(
+      (b) => b.title.toLowerCase() === roleText.toLowerCase(),
+    );
+    // If we matched a static benchmark, the assistant will use it; if
+    // not, the dynamic synthesiser kicks in on the server side via
+    // `hints.role`. We always send the typed text in `hints.role` so
+    // the user sees the role they asked for, even if the synthesised
+    // benchmark title differs slightly.
+    const hints: {
+      benchmarkKey?: string;
+      role: string;
+      weeks?: number;
+      tone?: "professional" | "friendly" | "enthusiastic";
+      company?: string;
+    } = {
+      role: roleText,
+      ...(benchmark ? { benchmarkKey: benchmark.key } : {}),
+      ...(activeChip === "roadmap" ? { weeks: chipWeeks } : {}),
+      ...(activeChip === "cover_letter"
+        ? { tone: chipTone, ...(chipCompany ? { company: chipCompany } : {}) }
+        : {}),
+    };
+    const displayTitle = benchmark?.title ?? roleText;
+    let content = "";
+    switch (activeChip) {
+      case "readiness":
+        content = "How ready am I for the " + displayTitle + " role?";
+        break;
+      case "gap_analysis":
+        content = "What skill gaps do I have for the " + displayTitle + " role?";
+        break;
+      case "roadmap":
+        content = "Build me a " + chipWeeks + "-week roadmap to become a " + displayTitle + ".";
+        break;
+      case "cover_letter":
+        content =
+          "Write a " + chipTone + " cover letter for the " + displayTitle +
+          " role" + (chipCompany ? " at " + chipCompany : "") + ".";
+        break;
+      default:
+        content = "Help me with the " + displayTitle + " role.";
+    }
+    void dispatch({ content, mode: activeChip, hints });
+  }, [activeId, loading, chipRole, chipWeeks, chipTone, chipCompany, activeChip, dispatch]);
 
   return (
     <div className="flex h-[calc(100vh-8rem)] gap-4">
@@ -248,23 +364,62 @@ export default function ChatPage() {
           </span>
           <div>
             <p className="font-heading text-sm font-semibold">CareerPilot Assistant</p>
-            <p className="text-xs text-secondary-500">
-              RAG-grounded in your CV, with live web search.
-            </p>
+            <p className="text-xs text-secondary-500">RAG-grounded in your CV with quick actions for each track.</p>
           </div>
         </header>
+
+        {/* Quick action chips */}
+        <div className="flex flex-wrap items-center gap-2 border-b border-secondary-100 px-5 py-3">
+          <ChipButton
+            active={activeChip === "readiness"}
+            onClick={() => setActiveChip("readiness")}
+            icon={<Compass className="h-3.5 w-3.5" />}
+            label="Readiness"
+          />
+          <ChipButton
+            active={activeChip === "gap_analysis"}
+            onClick={() => setActiveChip("gap_analysis")}
+            icon={<Target className="h-3.5 w-3.5" />}
+            label="Skill gaps"
+          />
+          <ChipButton
+            active={activeChip === "roadmap"}
+            onClick={() => setActiveChip("roadmap")}
+            icon={<CalendarRange className="h-3.5 w-3.5" />}
+            label="Roadmap"
+          />
+          <ChipButton
+            active={activeChip === "cover_letter"}
+            onClick={() => setActiveChip("cover_letter")}
+            icon={<Mail className="h-3.5 w-3.5" />}
+            label="Cover letter"
+          />
+        </div>
+
+        {/* Chip-specific panel (benchmark/weeks/tone) */}
+        <ChipPanel
+          mode={activeChip}
+          role={chipRole}
+          onRoleChange={setChipRole}
+          weeks={chipWeeks}
+          onWeeksChange={setChipWeeks}
+          tone={chipTone}
+          onToneChange={setChipTone}
+          company={chipCompany}
+          onCompanyChange={setChipCompany}
+          onSubmit={chipSubmit}
+          disabled={!activeId || loading}
+        />
 
         <div ref={scrollRef} className="flex-1 space-y-4 overflow-y-auto p-5">
           {messages.length === 0 ? (
             <EmptyState />
           ) : (
-            messages.map((m, i) => <Bubble key={m.id ?? `${m.role}-${i}`} message={m} />)
+            messages.map((m, i) => <Bubble key={m.id ?? m.role + "-" + i} message={m} />)
           )}
           {loading && <TypingBubble />}
           {error && (
-            <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-              {error}
-            </div>
+            <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>
           )}
         </div>
 
@@ -274,11 +429,7 @@ export default function ChatPage() {
             onChange={(e) => setInput(e.target.value)}
             disabled={!activeId || loading}
             type="text"
-            placeholder={
-              activeId
-                ? "e.g. Which roles fit my Next.js + Supabase experience?"
-                : "Create a thread to start chatting..."
-            }
+            placeholder={activeId ? "Ask anything about your job search..." : "Create a thread to start chatting..."}
             className="flex-1 rounded-lg border border-secondary-100 bg-secondary-50/40 px-3 py-2 text-sm outline-none focus:border-primary focus:bg-white disabled:opacity-50"
           />
           <button
@@ -304,7 +455,7 @@ function EmptyState() {
         <Sparkles className="h-4 w-4" />
       </span>
       <div className="rounded-2xl rounded-tl-sm bg-secondary-50 px-4 py-3 text-sm text-secondary-700">
-        Ask me anything about your job search — I&apos;ll cite the CV chunks I use to answer.
+        Pick a quick action above (Readiness, Skill gaps, Roadmap, Cover letter) or just type a question - I will ground my answer in your CV and live web search.
       </div>
     </div>
   );
@@ -330,7 +481,11 @@ function Bubble({ message }: { message: Message }) {
             : "rounded-tl-sm bg-secondary-50 text-secondary-700",
         )}
       >
-        <p className="whitespace-pre-wrap">{message.content}</p>
+        {message.structured ? (
+          <StructuredCard data={message.structured} />
+        ) : (
+          <p className="whitespace-pre-wrap">{message.content}</p>
+        )}
         {message.citations && message.citations.length > 0 && (
           <div className="mt-3 space-y-2 border-t border-secondary-200 pt-2 text-xs">
             <p className="font-semibold uppercase tracking-wider text-secondary-500">Citations</p>
@@ -356,6 +511,309 @@ function TypingBubble() {
       <div className="rounded-2xl rounded-tl-sm bg-secondary-50 px-4 py-3 text-sm text-secondary-700">
         <Loader2 className="h-4 w-4 animate-spin text-secondary-400" />
       </div>
+    </div>
+  );
+}
+
+function ChipButton({ active, onClick, icon, label }: { active: boolean; onClick: () => void; icon: React.ReactNode; label: string }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium transition",
+        active
+          ? "border-primary bg-primary text-white shadow-sm"
+          : "border-secondary-200 bg-white text-secondary-700 hover:border-primary/40 hover:bg-primary-50/40",
+      )}
+    >
+      {icon}
+      {label}
+    </button>
+  );
+}
+
+const CHIP_TITLE: Record<AssistantMode, string> = {
+  readiness: "Assess your readiness for a role",
+  gap_analysis: "Find the gaps blocking a fit",
+  roadmap: "Plan how to close the gaps",
+  cover_letter: "Draft a tailored cover letter",
+  general: "Ask anything",
+};
+
+function ChipPanel(props: {
+  mode: AssistantMode;
+  role: string;
+  onRoleChange: (v: string) => void;
+  weeks: number;
+  onWeeksChange: (n: number) => void;
+  tone: "professional" | "friendly" | "enthusiastic";
+  onToneChange: (t: "professional" | "friendly" | "enthusiastic") => void;
+  company: string;
+  onCompanyChange: (v: string) => void;
+  onSubmit: () => void;
+  disabled: boolean;
+}) {
+  return (
+    <div className="border-b border-secondary-100 bg-secondary-50/40 px-5 py-3">
+      <p className="mb-2 text-xs font-medium uppercase tracking-wide text-secondary-500">{CHIP_TITLE[props.mode]}</p>
+      <div className="flex flex-wrap items-end gap-3">
+        <RoleInput
+          value={props.role}
+          onChange={props.onRoleChange}
+          disabled={props.disabled}
+        />
+        {props.mode === "roadmap" && (
+          <NumberField label="Weeks" value={props.weeks} min={1} max={24} onChange={props.onWeeksChange} disabled={props.disabled} />
+        )}
+        {props.mode === "cover_letter" && (
+          <>
+            <TextField label="Company (optional)" value={props.company} onChange={props.onCompanyChange} disabled={props.disabled} placeholder="e.g. Vercel" />
+            <ToneSelect value={props.tone} onChange={props.onToneChange} disabled={props.disabled} />
+          </>
+        )}
+        <button
+          type="button"
+          onClick={props.onSubmit}
+          disabled={props.disabled}
+          className="ml-auto inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-primary-600 disabled:opacity-50"
+        >
+          <Sparkles className="h-3.5 w-3.5" />
+          Run
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Free-text role input with autocomplete over the curated BENCHMARKS list.
+ * - The user can pick a known role (saves a synthesis call on the server).
+ * - The user can type any other role; the server synthesises a benchmark
+ *   on demand and caches it for the session.
+ *
+ * The datalist is intentionally suggestions-only: leaving the field
+ * alone after typing keeps the typed text intact and routes to synthesis.
+ */
+function RoleInput({ value, onChange, disabled }: { value: string; onChange: (v: string) => void; disabled?: boolean }) {
+  return (
+    <label className="flex min-w-[16rem] flex-1 flex-col gap-1 text-xs text-secondary-600 sm:max-w-xs">
+      <span>Target role</span>
+      <input
+        type="text"
+        list="cp-chip-role-suggestions"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        disabled={disabled}
+        placeholder="e.g. MLOps Engineer, Junior iOS Developer, Solutions Architect"
+        className="rounded-lg border border-secondary-200 bg-white px-3 py-1.5 text-sm text-secondary-800 outline-none focus:border-primary disabled:opacity-50"
+      />
+      <datalist id="cp-chip-role-suggestions">
+        {BENCHMARKS.map((b) => (
+          <option key={b.key} value={b.title}>{b.blurb}</option>
+        ))}
+      </datalist>
+    </label>
+  );
+}
+
+function NumberField({ label, value, min, max, onChange, disabled }: { label: string; value: number; min: number; max: number; onChange: (n: number) => void; disabled?: boolean }) {
+  return (
+    <label className="flex flex-col gap-1 text-xs text-secondary-600">
+      <span>{label}</span>
+      <input
+        type="number"
+        min={min}
+        max={max}
+        value={value}
+        onChange={(e) => onChange(Math.max(min, Math.min(max, Number(e.target.value) || min)))}
+        disabled={disabled}
+        className="w-24 rounded-lg border border-secondary-200 bg-white px-3 py-1.5 text-sm text-secondary-800 outline-none focus:border-primary disabled:opacity-50"
+      />
+    </label>
+  );
+}
+
+function TextField({ label, value, onChange, disabled, placeholder }: { label: string; value: string; onChange: (v: string) => void; disabled?: boolean; placeholder?: string }) {
+  return (
+    <label className="flex flex-col gap-1 text-xs text-secondary-600">
+      <span>{label}</span>
+      <input
+        type="text"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        disabled={disabled}
+        placeholder={placeholder}
+        className="w-48 rounded-lg border border-secondary-200 bg-white px-3 py-1.5 text-sm text-secondary-800 outline-none focus:border-primary disabled:opacity-50"
+      />
+    </label>
+  );
+}
+
+function ToneSelect({ value, onChange, disabled }: { value: "professional" | "friendly" | "enthusiastic"; onChange: (t: "professional" | "friendly" | "enthusiastic") => void; disabled?: boolean }) {
+  return (
+    <label className="flex flex-col gap-1 text-xs text-secondary-600">
+      <span>Tone</span>
+      <div className="relative">
+        <select
+          value={value}
+          onChange={(e) => onChange(e.target.value as "professional" | "friendly" | "enthusiastic")}
+          disabled={disabled}
+          className="appearance-none rounded-lg border border-secondary-200 bg-white px-3 py-1.5 pr-7 text-sm text-secondary-800 outline-none focus:border-primary disabled:opacity-50"
+        >
+          <option value="professional">Professional</option>
+          <option value="friendly">Friendly</option>
+          <option value="enthusiastic">Enthusiastic</option>
+        </select>
+        <ChevronDown className="pointer-events-none absolute right-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-secondary-400" />
+      </div>
+    </label>
+  );
+}
+
+function StructuredCard({ data }: { data: NonNullable<Message["structured"]> }) {
+  switch (data.kind) {
+    case "readiness":
+      return <ReadinessCard data={data} />;
+    case "gap_analysis":
+      return <GapCard data={data} />;
+    case "roadmap":
+      return <RoadmapCard data={data} />;
+    case "cover_letter":
+      return <CoverCard data={data} />;
+    default:
+      return null;
+  }
+}
+
+function fitTone(band: "strong" | "moderate" | "weak") {
+  if (band === "strong") return "border-emerald-300 bg-emerald-50 text-emerald-800";
+  if (band === "moderate") return "border-amber-300 bg-amber-50 text-amber-800";
+  return "border-rose-300 bg-rose-50 text-rose-800";
+}
+
+function FitPill({ score }: { score: FitScoreResult }) {
+  return (
+    <span
+      title={score.label}
+      className={cn(
+        "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium",
+        fitTone(score.band),
+      )}
+    >
+      <span className="size-1.5 rounded-full bg-current" aria-hidden />
+      {score.label}
+    </span>
+  );
+}
+
+function ReadinessCard({ data }: { data: Extract<NonNullable<Message["structured"]>, { kind: "readiness" }> }) {
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-secondary-500">Readiness</div>
+          <div className="text-sm font-semibold text-secondary-900">{data.benchmarkTitle}</div>
+        </div>
+        <FitPill score={data.overall} />
+      </div>
+      <p className="text-sm text-secondary-700">{data.summary}</p>
+      {data.buckets.map((b) => (
+        <div key={b.id} className="rounded-lg border border-secondary-200 p-3">
+          <div className="mb-1 flex items-center justify-between">
+            <div className="text-sm font-medium text-secondary-800">{b.label}</div>
+            <FitPill score={b.score} />
+          </div>
+          <p className="text-xs text-secondary-600">{b.rationale}</p>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function GapCard({ data }: { data: Extract<NonNullable<Message["structured"]>, { kind: "gap_analysis" }> }) {
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-secondary-500">Skill gaps</div>
+          <div className="text-sm font-semibold text-secondary-900">{data.benchmarkTitle}</div>
+        </div>
+        <FitPill score={data.overall} />
+      </div>
+      <p className="text-sm text-secondary-700">{data.summary}</p>
+      {data.missing.length === 0 ? (
+        <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800">No major gaps detected. You look ready to apply.</div>
+      ) : (
+        <ul className="space-y-2">
+          {data.missing.map((m) => (
+            <li key={m.skill} className="rounded-lg border border-secondary-200 p-3">
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-medium text-secondary-800">{m.skill}</div>
+                <span className="text-xs text-secondary-500">priority {m.priority}/5</span>
+              </div>
+              <p className="mt-1 text-xs text-secondary-600">{m.reason}</p>
+              {m.evidence && <p className="mt-1 text-[11px] text-secondary-500">Evidence: {m.evidence}</p>}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function RoadmapCard({ data }: { data: Extract<NonNullable<Message["structured"]>, { kind: "roadmap" }> }) {
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-secondary-500">Learning roadmap</div>
+          <div className="text-sm font-semibold text-secondary-900">
+            {data.benchmarkTitle} <span className="text-secondary-500">in {data.weeks} weeks</span>
+          </div>
+        </div>
+        <FitPill score={data.overall} />
+      </div>
+      <p className="text-sm text-secondary-700">{data.summary}</p>
+      <ol className="space-y-2">
+        {data.weeks_plan.map((w) => (
+          <li key={w.week} className="rounded-lg border border-secondary-200 p-3">
+            <div className="mb-1 flex items-center justify-between">
+              <div className="text-sm font-medium text-secondary-800">Week {w.week}</div>
+              <span className="text-xs text-secondary-500">{w.focus}</span>
+            </div>
+            <ul className="ml-4 list-disc text-xs text-secondary-700">
+              {w.tasks.map((t, i) => <li key={i}>{t}</li>)}
+            </ul>
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
+function CoverCard({ data }: { data: Extract<NonNullable<Message["structured"]>, { kind: "cover_letter" }> }) {
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-secondary-500">Cover letter</div>
+          <div className="text-sm font-semibold text-secondary-900">
+            {data.benchmarkTitle}
+            {data.company && <span className="text-secondary-500"> at {data.company}</span>}
+            <span className="text-secondary-500"> - {data.tone}</span>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => navigator.clipboard.writeText(data.body)}
+          className="rounded-md border border-secondary-200 px-2 py-1 text-xs text-secondary-700 hover:bg-secondary-50"
+        >
+          Copy
+        </button>
+      </div>
+      <p className="text-sm text-secondary-700">{data.summary}</p>
+      <pre className="whitespace-pre-wrap rounded-lg border border-secondary-200 bg-secondary-50 p-3 text-sm text-secondary-800">{data.body}</pre>
     </div>
   );
 }

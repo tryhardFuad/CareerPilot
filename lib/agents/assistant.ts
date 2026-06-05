@@ -37,6 +37,7 @@ import {
   type ScoredSkill,
 } from "@/lib/agents/fitScore";
 import { BENCHMARKS, BENCHMARK_LIST, type RoleBenchmark } from "@/lib/data/benchmarks";
+import { getOrSynthesiseBenchmark } from "@/lib/data/benchmarks/dynamic";
 
 // ---------- Public types ----------
 
@@ -60,6 +61,15 @@ export interface AssistantInput {
   /** Optional structured inputs from a chip. */
   hints?: {
     benchmarkKey?: string;
+    /**
+     * Free-text role the user typed (e.g. "MLOps Engineer at a fintech").
+     * If `benchmarkKey` doesn't match a static role, this is used to
+     * synthesise a benchmark on the fly. Mutually exclusive with
+     * `benchmark` — if both are set, `benchmark` wins.
+     */
+    role?: string;
+    /** Pre-resolved benchmark; callers that already have one can pass it. */
+    benchmark?: RoleBenchmark;
     weeks?: number;
     tone?: "professional" | "friendly" | "enthusiastic";
     company?: string;
@@ -193,6 +203,35 @@ function pickBenchmarkKey(
   return undefined;
 }
 
+/**
+ * Resolve the benchmark for a specialised chip. Order of precedence:
+ *   1. Inline `hints.benchmark` (caller already resolved it).
+ *   2. Static `hints.benchmarkKey` (one of the 4 curated roles).
+ *   3. Free-text `hints.role` — synthesise on the fly via Gemini.
+ *   4. The classifier's `benchmarkKey` (if it matched a static role).
+ * Returns null if none could be resolved; the caller should fall back
+ * to general chat in that case.
+ */
+async function resolveBenchmark(
+  userId: string,
+  hints: AssistantInput["hints"] | undefined,
+  classifiedKey: string | undefined,
+): Promise<RoleBenchmark | null> {
+  if (hints?.benchmark) return hints.benchmark;
+  const key = pickBenchmarkKey(hints, classifiedKey);
+  if (key) return BENCHMARKS[key] ?? null;
+  if (hints?.role && hints.role.trim().length > 0) {
+    try {
+      return await getOrSynthesiseBenchmark(userId, hints.role);
+    } catch (err) {
+      // Synthesis failed — caller will fall back to general chat.
+      console.warn("[assistant] dynamic benchmark synthesis failed", err);
+      return null;
+    }
+  }
+  return null;
+}
+
 function summariseFitScore(fit: FitScoreResult): string {
   const matched = fit.matched.map((m) => m.skill.label).join(", ") || "none";
   const missing = fit.missing.map((m) => m.skill.label).join(", ") || "none";
@@ -237,7 +276,7 @@ async function runReadiness(
   benchmark: RoleBenchmark,
   message: string,
 ): Promise<AssistantResponse & { mode: "readiness" }> {
-  const fit = await scoreFitScore({ userId, benchmarkKey: benchmark.key });
+  const fit = await scoreFitScore({ userId, benchmark });
   const raw = await chatComplete(
     [{ role: "user", parts:
       `The user asks: "${message}"\n\n` +
@@ -245,6 +284,7 @@ async function runReadiness(
       `Fit-score summary:\n${summariseFitScore(fit)}`,
     }],
     {
+      tier: "quality",
       systemInstruction:
         "You are a sharp, action-oriented career coach. " +
         "Be honest about readiness — do not flatter. " +
@@ -298,7 +338,7 @@ async function runGapAnalysis(
   benchmark: RoleBenchmark,
   message: string,
 ): Promise<AssistantResponse & { mode: "gap_analysis" }> {
-  const fit = await scoreFitScore({ userId, benchmarkKey: benchmark.key });
+  const fit = await scoreFitScore({ userId, benchmark });
   const raw = await chatComplete(
     [{ role: "user", parts:
       `The user asks: "${message}"\n\n` +
@@ -307,6 +347,7 @@ async function runGapAnalysis(
       `Focus on the missing must-have skills. Return JSON.`,
     }],
     {
+      tier: "quality",
       systemInstruction:
         "You are a pragmatic career coach. " +
         "Identify the top 3-5 skills the user must close to become competitive. " +
@@ -360,7 +401,7 @@ async function runRoadmap(
   weeks: number,
   message: string,
 ): Promise<AssistantResponse & { mode: "roadmap" }> {
-  const fit = await scoreFitScore({ userId, benchmarkKey: benchmark.key });
+  const fit = await scoreFitScore({ userId, benchmark });
   const raw = await chatComplete(
     [{ role: "user", parts:
       `The user asks: "${message}"\n\n` +
@@ -371,6 +412,7 @@ async function runRoadmap(
       `Build a ${weeks}-week plan that closes the top gaps first, then layers on nice-to-haves.`,
     }],
     {
+      tier: "quality",
       systemInstruction:
         "You are a focused learning-path designer. " +
         "Front-load the highest-impact skills from the gap list. " +
@@ -420,8 +462,12 @@ async function runCoverLetter(
   company: string | undefined,
   message: string,
 ): Promise<AssistantResponse & { mode: "cover_letter" }> {
-  const fit = await scoreFitScore({ userId, benchmarkKey: benchmark.key });
+  const fit = await scoreFitScore({ userId, benchmark });
   const companyLine = company ? `Target company: ${company}\n` : "";
+  // Target word count is intentional — keeps the model focused and avoids
+  // silent truncation. 1200 tokens is enough headroom for a 320-word letter
+  // plus JSON wrapping and the subject line, even with marker bloat.
+  const WORD_TARGET = 320;
   const raw = await chatComplete(
     [{ role: "user", parts:
       `The user asks: "${message}"\n\n` +
@@ -431,24 +477,36 @@ async function runCoverLetter(
       `Strengths to lead with: ${fit.matched.slice(0, 5).map((m) => m.skill.label).join(", ")}\n` +
       `Experience: ${fit.experience.inferredYears}y\n` +
       `Rationale: ${fit.rationale}\n\n` +
-      `Write a ${tone} cover letter, 250-350 words. Open with a specific, non-generic hook. ` +
-      `Lead with the user's top strengths. Do NOT mention the fit score.`,
+      `Write a ${tone} cover letter, exactly ~${WORD_TARGET} words (range 280-340). ` +
+      `Open with a specific, non-generic hook tied to the role or company. ` +
+      `Lead with the user's top strengths. Do NOT mention the fit score. ` +
+      `End with a confident, specific sign-off (no placeholder placeholders).`,
     }],
     {
+      tier: "quality",
       systemInstruction:
         "You write cover letters that don't sound like cover letters. " +
-        "Avoid clichés ('I am writing to apply', 'passionate about'). " +
-        "Use the user's strengths as evidence. Keep it under 350 words.",
+        "Avoid clichés ('I am writing to apply', 'passionate about', 'I would be a great fit'). " +
+        "Use the user's strengths as concrete evidence. " +
+        `Hit approximately ${WORD_TARGET} words. Finish every sentence — never stop mid-thought.`,
       generationConfig: {
         temperature: 0.7,
-        maxOutputTokens: 900,
+        maxOutputTokens: 1200,
         responseMimeType: "application/json",
         responseSchema: COVER_LETTER_SCHEMA,
       },
     },
   );
   const parsed = JSON.parse(raw) as { subject: string; body: string };
-  const text = `**Subject:** ${parsed.subject}\n\n${parsed.body}`;
+  // Sanity-check: if the model came back with a letter that ends mid-sentence
+  // (no terminal punctuation, last word clipped) we surface a soft warning in
+  // the persisted message so the UI can hint at a retry.
+  const body = parsed.body?.trim() ?? "";
+  const endsCleanly = /[.!?\"]\s*$/.test(body);
+  const warning = endsCleanly
+    ? ""
+    : "\n\n*(This draft may be truncated. Click Run again to regenerate.)*";
+  const text = `**Subject:** ${parsed.subject}\n\n${body}${warning}`;
   return {
     mode: "cover_letter",
     message: text,
@@ -505,7 +563,7 @@ export async function runAssistant(
 
   // Resolve intent + structured fields.
   let intent: AssistantIntent = intentHint ?? "general";
-  let benchmarkKey: string | undefined;
+  let classifiedKey: string | undefined;
   let weeks = hints?.weeks ?? 6;
   let tone = hints?.tone ?? "professional";
   let company: string | undefined = hints?.company;
@@ -513,44 +571,33 @@ export async function runAssistant(
   if (!intentHint) {
     const classified = await classifyIntent(message);
     intent = classified.intent;
-    benchmarkKey = classified.benchmarkKey;
+    classifiedKey = classified.benchmarkKey;
     if (classified.weeks) weeks = classified.weeks;
     if (classified.tone) tone = classified.tone;
     if (classified.company) company = classified.company;
-  } else {
-    benchmarkKey = pickBenchmarkKey(hints, hints?.benchmarkKey);
   }
 
-  // Specialised modes need a benchmark. If we couldn't resolve one, fall
-  // back to general chat (with a soft hint in the message).
-  const benchmark = benchmarkKey ? BENCHMARKS[benchmarkKey] : undefined;
-  if (intent !== "general" && !benchmark) {
-    // Try one more thing: ask the classifier to extract a benchmark.
-    if (!intentHint) {
-      const fallback = await classifyIntent(message + " role:data-engineer");
-      if (fallback.benchmarkKey && BENCHMARKS[fallback.benchmarkKey]) {
-        return dispatchSpecialised(
-          userId, message, fallback.benchmarkKey, weeks, tone, company,
-          retrieveCvChunks,
-        );
-      }
-    }
+  // General chat — no benchmark needed.
+  if (intent === "general") {
     return runGeneralChat(userId, message, history, retrieveCvChunks);
   }
 
-  if (intent === "general" || !benchmark) {
+  // Specialised modes need a benchmark. Resolution chain (in order):
+  //   inline > static key > synthesise from free-text role.
+  const benchmark = await resolveBenchmark(userId, hints, classifiedKey);
+  if (!benchmark) {
     return runGeneralChat(userId, message, history, retrieveCvChunks);
   }
 
   return dispatchSpecialised(
-    userId, message, benchmark.key, weeks, tone, company, retrieveCvChunks,
+    userId, message, benchmark, weeks, tone, company, retrieveCvChunks,
   );
 }
 
 function dispatchSpecialised(
   userId: string,
   message: string,
-  benchmarkKey: string,
+  benchmark: RoleBenchmark,
   weeks: number,
   tone: NonNullable<AssistantInput["hints"]>["tone"],
   company: string | undefined,
@@ -559,7 +606,6 @@ function dispatchSpecialised(
     query: string,
   ) => Promise<{ id: string; source: string; text: string; score: number }[]>,
 ): Promise<AssistantResponse> {
-  const benchmark = BENCHMARKS[benchmarkKey]!;
   switch (true) {
     case message.toLowerCase().includes("roadmap") ||
          message.toLowerCase().includes("plan") ||
