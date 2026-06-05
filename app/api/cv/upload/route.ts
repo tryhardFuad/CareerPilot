@@ -62,6 +62,34 @@ export async function POST(req: Request) {
     return r as Response;
   }
 
+  // Outer safety net: any unhandled throw inside the upload
+  // pipeline (transitive module-init failure on the serverless
+  // function, missing env var, Supabase/Gemini outage, etc.)
+  // used to bubble up as Next.js's default 500 HTML page, which
+  // the client tried to `res.json()` and surfaced as
+  // `Unexpected token '<', "<!DOCTYPE "... is not valid JSON`.
+  // Catch it here, log the real cause, and return a parseable
+  // JSON 500 so the client can show a useful error and the
+  // function logs get the actual stack trace.
+  try {
+    return await handleUpload(req, userId);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error("[api/cv/upload] unhandled:", err);
+    const message = err instanceof Error ? err.message : String(err);
+    const stack = err instanceof Error ? err.stack : undefined;
+    return NextResponse.json(
+      {
+        error: message,
+        code: "upload_failed",
+        ...(process.env.NODE_ENV !== "production" ? { stack } : {}),
+      },
+      { status: 500 },
+    );
+  }
+}
+
+async function handleUpload(req: Request, userId: string) {
   // 1. Parse multipart.
   let form: FormData;
   try {
