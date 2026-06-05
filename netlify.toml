@@ -46,13 +46,16 @@
 
 # Per-function timeout overrides. The default Netlify
 # sync-function timeout is 10s (free) / 26s (Pro). Our
-# `/api/cv/upload` route is intentionally synchronous
-# (parse + chunk + Gemini embed runs inline) and routinely
-# takes 15-30s, so we lift the cap to the Pro maximum.
-# Background functions, when added, can use the 15-min
-# default without explicit configuration.
-[functions."app/api/cv/upload"]
-  timeout = 26
+# `/api/cv/upload` route is now a thin shim (validate +
+# storage upload + dispatch the background function) that
+# returns in ~2s, so the default 10s is plenty.
+#
+# The slow work (parse + chunk + Gemini embed) runs in
+# `netlify/functions/process-cv-background.ts` which gets
+# the 15-min background-function budget automatically by
+# virtue of the `-background` filename suffix.
+# (Background functions, when added, can use the 15-min
+# default without explicit configuration.)
 
 # ---------- Plugins ----------
 #

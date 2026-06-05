@@ -2,18 +2,41 @@
  * POST /api/cv/upload
  *
  * Upload a CV file (PDF or DOCX), persist it to Supabase
- * Storage, and run the ingester synchronously to chunk +
- * embed it. The new CV becomes the active one on success;
- * a failed upload leaves the previous active CV untouched.
+ * Storage, and DISPATCH the ingester to a Netlify background
+ * function. The route returns within ~2s with the new CV id
+ * in `processing` state; the heavy lifting (parse + chunk +
+ * embed) happens out-of-band with a 15-minute budget. The
+ * client polls the CV row and sees the status flip to
+ * `ready` (then flips to `is_active=true`) or `failed`
+ * naturally.
+ *
+ * Why a background function
+ * -------------------------
+ * The synchronous CV ingestion pipeline routinely takes
+ * 15-30s for a typical CV (storage download + unpdf parse +
+ * chunker + Gemini batch-embed 5-10s alone + Supabase RPC).
+ * Netlify's *sync* function ceiling is 10s (free) / 26s (Pro)
+ * — when that hits the platform returns
+ * `502 FUNCTION_INVOCATION_TIMEOUT` with an EMPTY body. The
+ * client saw that empty 5xx as
+ * "Upload failed (500 no response body)" — confusing.
+ *
+ * On top of that, when the project-level Gemini quota is
+ * exhausted mid-ingestion, `withBackoff` may need to wait
+ * 60s+ for the window to refill. That can never fit inside
+ * a 26s sync budget.
+ *
+ * Moving the work to a background function (15-min budget)
+ * eliminates both problems.
  *
  * Body: multipart/form-data with a `file` field. Optional
  *       `setActive: "true" | "false"` (default true).
  *
  * Response (200):
- *   { cv: CvSummary, result: IngestionResult }
+ *   { cv: CvSummary, dispatched: true }
  *
  * Response (4xx):
- *   { error: string, code: "no_file" | "bad_mime" | "too_big" | "ingest_failed" }
+ *   { error: string, code: "no_file" | "bad_mime" | "too_big" | "dispatch_failed" }
  *
  * Auth: Clerk (requireUserId).
  * Runtime: nodejs — the parser uses Buffer and pdf-parse needs
@@ -23,13 +46,14 @@
 import { NextResponse } from "next/server";
 import { requireUserId } from "@/lib/auth/require-user";
 import { supabaseAdmin } from "@/lib/supabase/admin";
-import { runIngestion, type IngestionResult } from "@/lib/cv/ingester";
 import { sniffMime } from "@/lib/cv/parser";
 
 export const runtime = "nodejs";
-// 20 MB. The bucket cap matches; we enforce here so we can
-// return a clean 413 instead of a stream-truncated error.
-export const maxDuration = 60; // seconds; covers parser + embedder
+export const maxDuration = 10; // seconds; only validate + store + dispatch
+// 10s is plenty now: we only validate + store + dispatch the
+// background function. The slow work (parse + embed) runs in
+// `netlify/functions/process-cv-background.ts` with a 15-min
+// budget.
 
 // ---------- Limits ----------
 
@@ -193,62 +217,70 @@ async function handleUpload(req: Request, userId: string) {
     );
   }
 
-  // 6. Run the ingester. This is the slow step (parse +
-  //    chunk + embed). For a typical CV it's a few seconds.
-  let result: IngestionResult;
-  try {
-    result = await runIngestion(cvId);
-  } catch (err) {
-    // The ingester already wrote status='failed' and
-    // error_message to the row. Don't touch the previous
-    // active CV.
-    const msg = err instanceof Error ? err.message : String(err);
-    return NextResponse.json(
-      { error: msg, code: "ingest_failed" },
-      { status: 500 },
-    );
-  }
-
-  // 7. If the parse flagged OCR, surface a 422 — the file
-  //    is "kept" (in failed state) but not indexed.
-  if (result.needsOcr) {
-    return NextResponse.json(
-      {
-        error:
-          "This PDF looks scanned. We saved it, but OCR isn't enabled yet — check back soon.",
-        code: "needs_ocr",
-        cv: cvRow as CvSummary,
-      },
-      { status: 422 },
-    );
-  }
-
-  // 8. Flip the new CV to active. The partial unique index
-  //    guarantees at most one active row per user, so we
-  //    first mark the previous active (if any) inactive.
+  // 6. Dispatch the ingester to the Netlify background
+  //    function. This is fire-and-forget: we don't await
+  //    the actual ingestion result (15-30s typical, up to
+  //    several minutes if the project-level Gemini quota
+  //    forces 60s+ backoff). The route returns within ~2s.
+  //
+  //    The background function:
+  //      - re-verifies ownership
+  //      - runs runIngestion(cvId) (parse + chunk + embed)
+  //      - flips is_active=true on success when setActive=true
+  //      - writes status='failed' + error_message on any throw
+  //
+  //    The client polls the cvs row to see the status flip.
   const setActive = (form.get("setActive") ?? "true") === "true";
-  if (setActive) {
-    await supabaseAdmin
+  const origin = new URL(req.url).origin;
+  const bgUrl = `${origin}/.netlify/functions/process-cv-background`;
+  try {
+    // Fire-and-forget: do NOT await. We log a dispatch error
+    // for observability, but we don't fail the upload just
+    // because the background dispatch itself hit a network
+    // blip — the cvs row is in the DB and can be retried
+    // manually from the dashboard.
+    void fetch(bgUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ cvId, userId, setActive }),
+    }).catch((err) => {
+      // eslint-disable-next-line no-console
+      console.error(`[api/cv/upload] background dispatch failed for ${cvId}:`, err);
+      // Best-effort: mark the row failed so the user can
+      // see something went wrong and retry. If even THIS
+      // update fails, the row stays in `processing` and
+      // the user can hit "retry" from the dashboard.
+      void supabaseAdmin
+        .from("cvs")
+        .update({
+          status: "failed",
+          error_message: `Background dispatch failed: ${err instanceof Error ? err.message : String(err)}`,
+        })
+        .eq("id", cvId);
+    });
+  } catch (err) {
+    // Synchronous throw from `fetch` itself (e.g. invalid
+    // URL on local dev where `/.netlify/functions/...` may
+    // not resolve). Same handling as above.
+    const msg = err instanceof Error ? err.message : String(err);
+    // eslint-disable-next-line no-console
+    console.error(`[api/cv/upload] background dispatch threw for ${cvId}:`, msg);
+    void supabaseAdmin
       .from("cvs")
-      .update({ is_active: false })
-      .eq("user_id", userId)
-      .eq("is_active", true)
-      .neq("id", cvId);
-    await supabaseAdmin
-      .from("cvs")
-      .update({ is_active: true })
+      .update({ status: "failed", error_message: `Background dispatch failed: ${msg}` })
       .eq("id", cvId);
   }
 
-  // 9. Re-read the row so the response reflects the final state.
-  const { data: finalRow } = await supabaseAdmin
-    .from("cvs")
-    .select("id, status, is_active, version")
-    .eq("id", cvId)
-    .single();
-
+  // 7. Return immediately with the new row in `processing`
+  //    state. The client polls this row to learn the
+  //    outcome; a successful ingestion flips status to
+  //    `ready` and (if requested) is_active to true.
   return NextResponse.json(
-    { cv: finalRow ?? cvRow, result },
-    { status: 200 },
+    {
+      cv: cvRow as CvSummary,
+      dispatched: true,
+      pollUrl: `/api/cv/${cvId}`,
+    },
+    { status: 202 },
   );
 }

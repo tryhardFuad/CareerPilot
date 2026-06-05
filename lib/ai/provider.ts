@@ -173,6 +173,16 @@ export async function embedText(
  * We size sub-batches at 20 (extra headroom) and pace them with a 2.5s gap
  * so a 250-chunk CV (~13 sub-batches) spreads across ~32s of wall time.
  * Peak sub-batch rate = 0.4/s, well under the project-level cap.
+ *
+ * Failure mode on a 429: we retry the sub-batch AT MOST ONCE
+ * (`maxAttempts: 2`) after honouring Gemini's `RetryInfo` hint
+ * (capped at 65s, one full quota window + jitter). If a
+ * sub-batch 429s on the retry, runIngestion writes
+ * `status='failed'` and the user retries the upload, by which
+ * point the per-minute window has refilled. This is much
+ * better than 5 attempts x 60s sleeps, which could waste 4
+ * minutes of a 15-min background budget on a single
+ * sub-batch.
  */
 const MAX_BATCH_SIZE = 20;
 const INTER_SUB_BATCH_MS = 2_500;
@@ -218,7 +228,7 @@ export async function embedBatch(
     const result = await geminiBreaker().run(() =>
       withBackoff(
         () => model.batchEmbedContents({ requests: slice }),
-        { maxAttempts: 5, baseMs: 1_000, capMs: 60_000 },
+        { maxAttempts: 2, baseMs: 1_000, capMs: 65_000 },
       ),
     );
     result.embeddings.forEach((e, j) => {
