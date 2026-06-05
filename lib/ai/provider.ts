@@ -160,6 +160,15 @@ export async function embedText(
 }
 
 /**
+ * Gemini's `batchEmbedContents` endpoint rejects any request whose `requests`
+ * array is longer than 100 entries. A long CV can produce 200+ chunks after
+ * chunking (especially in DOCX with paragraph-per-bullet structure), so we
+ * fan the input out into sub-batches of <= 100 and call the API sequentially.
+ * `withBackoff` still applies per-sub-batch for transient 429s.
+ */
+const MAX_BATCH_SIZE = 100;
+
+/**
  * Embed many texts in one round trip. Used by the CV ingester to amortise
  * latency across chunks.
  */
@@ -172,7 +181,10 @@ export async function embedBatch(
     model: options.model ?? AI_CONFIG.embedModel,
   });
   const taskType = options.taskType ? TaskType[options.taskType] : undefined;
-  const requests = texts.map((t, i) => {
+  const baseTitle = options.title ?? "chunk";
+
+  // Pre-build every request so titles stay globally unique across sub-batches.
+  const allRequests = texts.map((t, i) => {
     const req: {
       content: { role: "user"; parts: { text: string }[] };
       taskType?: typeof TaskType[keyof typeof TaskType];
@@ -181,23 +193,29 @@ export async function embedBatch(
       content: { role: "user", parts: [{ text: t }] },
     };
     if (taskType) req.taskType = taskType;
-    req.title = options.title ?? `chunk-${i}`;
+    req.title = `${baseTitle}-${i}`;
     return req;
   });
-  const result = await geminiBreaker().run(() =>
-    withBackoff(
-      () => model.batchEmbedContents({ requests }),
-      { maxAttempts: 3, baseMs: 800, capMs: 8_000 },
-    ),
-  );
-  return result.embeddings.map((e, i) => {
-    if (!e.values || e.values.length !== EMBEDDING_DIM) {
-      throw new Error(
-        `[ai/provider] Embedding dim mismatch in batch at index ${i}: expected ${EMBEDDING_DIM}, got ${e.values?.length ?? 0}.`,
-      );
-    }
-    return e.values;
-  });
+
+  const out: number[][] = [];
+  for (let i = 0; i < allRequests.length; i += MAX_BATCH_SIZE) {
+    const slice = allRequests.slice(i, i + MAX_BATCH_SIZE);
+    const result = await geminiBreaker().run(() =>
+      withBackoff(
+        () => model.batchEmbedContents({ requests: slice }),
+        { maxAttempts: 3, baseMs: 800, capMs: 8_000 },
+      ),
+    );
+    result.embeddings.forEach((e, j) => {
+      if (!e.values || e.values.length !== EMBEDDING_DIM) {
+        throw new Error(
+          `[ai/provider] Embedding dim mismatch in batch at index ${i + j}: expected ${EMBEDDING_DIM}, got ${e.values?.length ?? 0}.`,
+        );
+      }
+      out.push(e.values);
+    });
+  }
+  return out;
 }
 
 // ---------- Chat (non-streaming) ----------
