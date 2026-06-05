@@ -60,6 +60,50 @@ export function isRateLimitError(err: unknown): boolean {
   return false;
 }
 
+/**
+ * If the provider's 429 / quota-exceeded response includes a structured
+ * `RetryInfo.retryDelay` (e.g. "15.7s" or "15000ms"), return it as ms.
+ * Gemini's free tier returns this in the JSON body of 429 responses and we
+ * should honour it exactly instead of guessing with jitter.
+ *
+ * Falls back to undefined when the field is absent or unparseable.
+ */
+export function extractRetryAfterMs(err: unknown): number | undefined {
+  if (!err) return undefined;
+  // Walk the error's `.details` / `.error.details` chain where the SDK nests
+  // the structured RpcViolation / RetryInfo objects.
+  const visit = (v: unknown): number | undefined => {
+    if (!v || typeof v !== "object") return undefined;
+    const obj = v as Record<string, unknown>;
+    if (typeof obj.retryDelay === "string") {
+      const m = obj.retryDelay.match(/^(\d+(?:\.\d+)?)\s*(s|ms)?$/i);
+      if (m && m[1] !== undefined) {
+        const n = parseFloat(m[1]);
+        if (!Number.isFinite(n)) return undefined;
+        const unit = (m[2] ?? "s").toLowerCase();
+        return unit === "s" ? Math.ceil(n * 1000) : Math.ceil(n);
+      }
+    }
+    // Some SDKs put the structured payload under `@type` markers; if we
+    // see a `@type` of type.googleapis.com/google.rpc.RetryInfo, descend.
+    if (typeof obj["@type"] === "string" && Array.isArray(obj.details)) {
+      for (const d of obj.details) {
+        const found = visit(d);
+        if (found !== undefined) return found;
+      }
+    }
+    if (Array.isArray(obj.details)) {
+      for (const d of obj.details) {
+        const found = visit(d);
+        if (found !== undefined) return found;
+      }
+    }
+    if (obj.error) return visit(obj.error);
+    return undefined;
+  };
+  return visit(err);
+}
+
 export type BackoffOpts = {
   maxAttempts?: number;   // total attempts including the first (default 3)
   baseMs?: number;        // first backoff window (default 500ms)
@@ -91,12 +135,24 @@ export async function withBackoff<T>(
       }
       if (attempt === maxAttempts) break;
 
-      // Full-jitter exponential: random in [0, min(cap, base * 2^(attempt-1))]
-      const window = Math.min(capMs, baseMs * 2 ** (attempt - 1));
-      const sleepMs = Math.floor(Math.random() * window);
-      console.warn(
-        `[backoff] attempt ${attempt}/${maxAttempts} hit rate limit, retrying in ${sleepMs}ms`,
-      );
+      // Prefer the server-supplied retryDelay (e.g. "15.7s" from Gemini's
+      // RetryInfo). Fall back to full-jitter exponential when absent.
+      const serverHint = extractRetryAfterMs(err);
+      let sleepMs: number;
+      if (serverHint !== undefined) {
+        // Honour the hint but never exceed the caller's cap.
+        sleepMs = Math.min(capMs, serverHint);
+        console.warn(
+          `[backoff] attempt ${attempt}/${maxAttempts} hit rate limit, ` +
+            `server said retry in ${serverHint}ms, sleeping ${sleepMs}ms`,
+        );
+      } else {
+        const window = Math.min(capMs, baseMs * 2 ** (attempt - 1));
+        sleepMs = Math.floor(Math.random() * window);
+        console.warn(
+          `[backoff] attempt ${attempt}/${maxAttempts} hit rate limit, retrying in ${sleepMs}ms`,
+        );
+      }
       await new Promise((r) => setTimeout(r, sleepMs));
     }
   }

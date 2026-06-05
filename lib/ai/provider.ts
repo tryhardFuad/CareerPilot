@@ -160,13 +160,18 @@ export async function embedText(
 }
 
 /**
- * Gemini's `batchEmbedContents` endpoint rejects any request whose `requests`
- * array is longer than 100 entries. A long CV can produce 200+ chunks after
- * chunking (especially in DOCX with paragraph-per-bullet structure), so we
- * fan the input out into sub-batches of <= 100 and call the API sequentially.
- * `withBackoff` still applies per-sub-batch for transient 429s.
+ * Gemini embedding quotas (free tier):
+ *   - `batchEmbedContents` request body: max 100 entries
+ *   - `embed_content_free_tier_requests`: 100 per minute per model per project
+ *
+ * The SDK counts each `text` inside a batched call against the per-minute
+ * quota, so a sub-batch of 100 burns the whole minute's budget in one go.
+ * We size sub-batches at 30 (well under both caps) and pace them with a
+ * 1.2s gap so consecutive sub-batches never co-occupy the same minute
+ * window. A 250-chunk CV needs ~9 sub-batches × (latency + 1.2s) ≈ 12s.
  */
-const MAX_BATCH_SIZE = 100;
+const MAX_BATCH_SIZE = 30;
+const INTER_SUB_BATCH_MS = 1_200;
 
 /**
  * Embed many texts in one round trip. Used by the CV ingester to amortise
@@ -199,11 +204,17 @@ export async function embedBatch(
 
   const out: number[][] = [];
   for (let i = 0; i < allRequests.length; i += MAX_BATCH_SIZE) {
+    if (i > 0) {
+      // Pace sub-batches so we don't fire 3 back-to-back sub-calls into the
+      // same per-minute window. INTER_SUB_BATCH_MS is intentionally > 1.2s
+      // even on small CVs to keep the worst-case rate under the 100/min cap.
+      await new Promise((r) => setTimeout(r, INTER_SUB_BATCH_MS));
+    }
     const slice = allRequests.slice(i, i + MAX_BATCH_SIZE);
     const result = await geminiBreaker().run(() =>
       withBackoff(
         () => model.batchEmbedContents({ requests: slice }),
-        { maxAttempts: 3, baseMs: 800, capMs: 8_000 },
+        { maxAttempts: 3, baseMs: 1_000, capMs: 30_000 },
       ),
     );
     result.embeddings.forEach((e, j) => {
