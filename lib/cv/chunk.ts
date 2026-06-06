@@ -1,27 +1,27 @@
-const SECTION_KEYWORDS = [
-  'EXPERIENCE', 'WORK EXPERIENCE', 'EDUCATION', 'SKILLS',
-  'TECHNICAL SKILLS', 'PROJECTS', 'SUMMARY', 'OBJECTIVE',
-  'CERTIFICATIONS', 'AWARDS', 'PUBLICATIONS', 'LANGUAGES',
-  'HACKATHON EXPERIENCE', 'ACHIEVEMENTS', 'INTERNSHIP',
+const SECTION_KEYWORDS: { pattern: RegExp; section: string }[] = [
+  { pattern: /^professional experience/i, section: 'experience' },
+  { pattern: /^work experience/i, section: 'work_experience' },
+  { pattern: /^research experience/i, section: 'experience' },
+  { pattern: /^teaching experience/i, section: 'experience' },
+  { pattern: /^internship/i, section: 'experience' },
+  { pattern: /^education/i, section: 'education' },
+  { pattern: /^skills/i, section: 'technical_skills' },
+  { pattern: /^technical skills/i, section: 'technical_skills' },
+  { pattern: /^projects/i, section: 'projects' },
+  { pattern: /^publications/i, section: 'publications' },
+  { pattern: /^patents/i, section: 'publications' },
+  { pattern: /^publications and patents/i, section: 'publications' },
+  { pattern: /^scholastic achievements/i, section: 'awards' },
+  { pattern: /^achievements/i, section: 'awards' },
+  { pattern: /^awards/i, section: 'awards' },
+  { pattern: /^certifications/i, section: 'certifications' },
+  { pattern: /^positions of responsibility/i, section: 'other' },
+  { pattern: /^extra curricular/i, section: 'other' },
+  { pattern: /^courses/i, section: 'other' },
+  { pattern: /^summary/i, section: 'summary' },
+  { pattern: /^objective/i, section: 'objective' },
+  { pattern: /^languages/i, section: 'technical_skills' },
 ]
-
-const SECTION_MAP: Record<string, string> = {
-  'EXPERIENCE': 'experience',
-  'WORK EXPERIENCE': 'work_experience',
-  'HACKATHON EXPERIENCE': 'experience',
-  'INTERNSHIP': 'experience',
-  'EDUCATION': 'education',
-  'SKILLS': 'skills',
-  'TECHNICAL SKILLS': 'technical_skills',
-  'PROJECTS': 'projects',
-  'SUMMARY': 'summary',
-  'OBJECTIVE': 'objective',
-  'CERTIFICATIONS': 'certifications',
-  'AWARDS': 'awards',
-  'ACHIEVEMENTS': 'awards',
-  'PUBLICATIONS': 'publications',
-  'LANGUAGES': 'skills',
-}
 
 export interface CvChunk {
   section: string
@@ -29,28 +29,21 @@ export interface CvChunk {
 }
 
 export function chunkCv(rawText: string): CvChunk[] {
-  // Insert a newline before any known section keyword found inline
-  let processed = rawText
-  for (const keyword of SECTION_KEYWORDS) {
-    const regex = new RegExp(`(?<![\\n])\\b(${keyword})\\b`, 'gi')
-    processed = processed.replace(regex, `\n$1`)
-  }
-
-  const lines = processed.split('\n')
+  const lines = rawText.split('\n')
   const chunks: CvChunk[] = []
   let currentSection = 'summary'
   let buffer: string[] = []
 
   for (const line of lines) {
-    const trimmed = line.trim().toUpperCase()
-    const matched = SECTION_KEYWORDS.find(k => trimmed === k || trimmed.startsWith(k + ' ') || trimmed.startsWith(k + ':'))
+    const trimmed = line.trim()
+    const matched = SECTION_KEYWORDS.find(k => k.pattern.test(trimmed))
 
-    if (matched) {
+    if (matched && trimmed.length < 60) {
       if (buffer.length > 0) {
         chunks.push({ section: currentSection, text: buffer.join('\n').trim() })
         buffer = []
       }
-      currentSection = SECTION_MAP[matched.toUpperCase()] ?? 'other'
+      currentSection = matched.section
     } else {
       buffer.push(line)
     }
