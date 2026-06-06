@@ -1,8 +1,15 @@
-const SECTION_HEADERS = /^(EXPERIENCE|WORK EXPERIENCE|EDUCATION|SKILLS|TECHNICAL SKILLS|PROJECTS|SUMMARY|OBJECTIVE|CERTIFICATIONS|AWARDS|PUBLICATIONS)/im
+const SECTION_KEYWORDS = [
+  'EXPERIENCE', 'WORK EXPERIENCE', 'EDUCATION', 'SKILLS',
+  'TECHNICAL SKILLS', 'PROJECTS', 'SUMMARY', 'OBJECTIVE',
+  'CERTIFICATIONS', 'AWARDS', 'PUBLICATIONS', 'LANGUAGES',
+  'HACKATHON EXPERIENCE', 'ACHIEVEMENTS', 'INTERNSHIP',
+]
 
 const SECTION_MAP: Record<string, string> = {
   'EXPERIENCE': 'experience',
   'WORK EXPERIENCE': 'work_experience',
+  'HACKATHON EXPERIENCE': 'experience',
+  'INTERNSHIP': 'experience',
   'EDUCATION': 'education',
   'SKILLS': 'skills',
   'TECHNICAL SKILLS': 'technical_skills',
@@ -11,7 +18,9 @@ const SECTION_MAP: Record<string, string> = {
   'OBJECTIVE': 'objective',
   'CERTIFICATIONS': 'certifications',
   'AWARDS': 'awards',
+  'ACHIEVEMENTS': 'awards',
   'PUBLICATIONS': 'publications',
+  'LANGUAGES': 'skills',
 }
 
 export interface CvChunk {
@@ -20,23 +29,28 @@ export interface CvChunk {
 }
 
 export function chunkCv(rawText: string): CvChunk[] {
-  const lines = rawText.split('\n')
+  // Insert a newline before any known section keyword found inline
+  let processed = rawText
+  for (const keyword of SECTION_KEYWORDS) {
+    const regex = new RegExp(`(?<![\\n])\\b(${keyword})\\b`, 'gi')
+    processed = processed.replace(regex, `\n$1`)
+  }
+
+  const lines = processed.split('\n')
   const chunks: CvChunk[] = []
   let currentSection = 'summary'
   let buffer: string[] = []
 
   for (const line of lines) {
     const trimmed = line.trim().toUpperCase()
-    const matched = Object.keys(SECTION_MAP).find(key => trimmed.startsWith(key))
+    const matched = SECTION_KEYWORDS.find(k => trimmed === k || trimmed.startsWith(k + ' ') || trimmed.startsWith(k + ':'))
 
     if (matched) {
       if (buffer.length > 0) {
         chunks.push({ section: currentSection, text: buffer.join('\n').trim() })
         buffer = []
       }
-      // `matched` is a key of SECTION_MAP, so this is always defined;
-      // the `!` is required because tsconfig has noUncheckedIndexedAccess.
-      currentSection = SECTION_MAP[matched]!
+      currentSection = SECTION_MAP[matched.toUpperCase()] ?? 'other'
     } else {
       buffer.push(line)
     }
