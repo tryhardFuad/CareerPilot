@@ -8,7 +8,12 @@ import { supabaseAdmin } from "@/lib/supabase/admin";
 import type { JobCard } from "@/lib/agents/hunter";
 
 export async function POST(req: NextRequest) {
-  const userId = await requireUserId();
+  let userId: string;
+  try {
+    userId = await requireUserId();
+  } catch (r) {
+    return r as Response;
+  }
 
   let body: { job?: JobCard };
   try {

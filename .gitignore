@@ -13,6 +13,11 @@
 /.next/
 /out/
 
+# local build/dev log artifacts
+/.build.log
+/.next-dev.log
+/.cp-build.log
+
 # production
 /build
 

@@ -110,10 +110,11 @@ export async function POST(
 
   // 5) Build the persistence payload. The DB column `mode` is the
   //    assistant mode (one of the five). `structured_result` is the
-  //    mode-specific payload -- fit-score, roadmap, cover letter, or
-  //    null for general chat (which just has citations).
+  //    mode-specific client-renderable payload (kind-discriminated
+  //    union) -- or null for general chat (which only has citations).
   const mode = response.mode;
-  const structured = extractStructured(response);
+  const structured =
+    response.mode === "general" ? null : response.structured;
   const citations: Citation[] | null =
     response.mode === "general" ? response.citations : null;
 
@@ -161,33 +162,6 @@ function toRouterCitations(
     text: c.text,
     score: c.score,
   }));
-}
-
-/**
- * Pull the mode-specific structured payload out of the AssistantResponse.
- * - readiness / gap_analysis: the fit-score result
- * - roadmap: the fit-score result + week count
- * - cover_letter: the fit-score result + tone + company
- * - general: null
- */
-function extractStructured(
-  r: AssistantResponse,
-): Record<string, unknown> | null {
-  switch (r.mode) {
-    case "readiness":
-    case "gap_analysis":
-      return { fitScore: r.fitScore };
-    case "roadmap":
-      return { fitScore: r.fitScore, weeks: r.weeks };
-    case "cover_letter":
-      return {
-        fitScore: r.fitScore,
-        tone: r.tone,
-        ...(r.company ? { company: r.company } : {}),
-      };
-    case "general":
-      return null;
-  }
 }
 
 /**

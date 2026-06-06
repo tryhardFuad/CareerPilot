@@ -122,13 +122,23 @@ export async function getOrSynthesiseBenchmark(
       responseSchema: SYNTHESIS_SCHEMA,
     },
   });
-  const parsed = JSON.parse(raw) as {
-    title: string;
-    summary: string;
-    mustHave: { id: string; label: string; weight?: number; category?: string }[];
-    niceToHave: { id: string; label: string; weight?: number; category?: string }[];
-    minExperienceYears: number;
-  };
+  const parsed = parseSynthesisResponse(raw, cleanInput);
+  if (!parsed.ok) {
+    // Synthesis failed. Don't crash the chip — fall back to a
+    // minimal-but-valid heuristic benchmark so the structured
+    // sub-agent (roadmap / gaps / readiness) can still run.
+    // Without this fallback the chat route silently drops the user
+    // back into general chat, which breaks the structured card.
+    console.warn(
+      "[dynamic] synthesis failed, using heuristic benchmark:",
+      parsed.error,
+    );
+    return buildHeuristicBenchmark(cleanInput);
+  }
+
+  // Synthesised cleanly. Map the model output to the canonical
+  // RoleBenchmark shape (slug, weights clamped, defaults filled).
+  const v = parsed.value;
 
   const mapSkill = (s: { id: string; label: string; weight?: number; category?: string }): Skill => ({
     id: s.id,
@@ -139,12 +149,12 @@ export async function getOrSynthesiseBenchmark(
 
   const benchmark: RoleBenchmark = {
     key: DYNAMIC_PREFIX + slugifyRole(cleanInput),
-    title: parsed.title || cleanInput,
-    summary: parsed.summary || `Custom role: ${cleanInput}`,
+    title: v.title || cleanInput,
+    summary: v.summary || `Custom role: ${cleanInput}`,
     domain: "Custom",
-    mustHave: parsed.mustHave.slice(0, 10).map(mapSkill),
-    niceToHave: parsed.niceToHave.slice(0, 8).map(mapSkill),
-    minExperienceYears: Math.max(0, Math.min(20, Math.floor(parsed.minExperienceYears ?? 1))),
+    mustHave: v.mustHave.slice(0, 10).map(mapSkill),
+    niceToHave: v.niceToHave.slice(0, 8).map(mapSkill),
+    minExperienceYears: Math.max(0, Math.min(20, Math.floor(v.minExperienceYears ?? 1))),
     minEducation: "bachelor",
     keywords: slugifyRole(cleanInput).split("-"),
     notes: "Synthesised on demand from the user's role input.",
@@ -171,4 +181,136 @@ export function listCustomRoles(): string[] {
   const set = new Set<string>();
   for (const b of CACHE.values()) set.add(b.title);
   return [...set];
+}
+// ---------- Internal: resilient parsing + heuristic fallback ----------
+
+interface SynthesisValue {
+  title: string;
+  summary: string;
+  mustHave: { id: string; label: string; weight?: number; category?: string }[];
+  niceToHave: { id: string; label: string; weight?: number; category?: string }[];
+  minExperienceYears: number;
+}
+
+type ParseResult =
+  | { ok: true; value: SynthesisValue }
+  | { ok: false; error: string };
+
+/**
+ * Parse the Gemini synthesis response. We:
+ *   1. Strip ```json / ``` fences if the model added them.
+ *   2. Try a plain JSON.parse.
+ *   3. If that fails (truncated output, stray quotes), try to repair
+ *      by closing the open string + open object. This recovers from
+ *      `maxOutputTokens` truncation in the common case.
+ */
+function parseSynthesisResponse(raw: string, fallbackTitle: string): ParseResult {
+  const cleaned = raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/```\s*$/i, "")
+    .trim();
+
+  // First attempt: vanilla parse.
+  try {
+    return { ok: true, value: JSON.parse(cleaned) as SynthesisValue };
+  } catch (firstErr) {
+    // Second attempt: try to repair common truncation/malformation
+    // by closing any open string + object. We bail with a clear error
+    // if the repair can't produce parseable JSON.
+    const repaired = attemptRepair(cleaned);
+    try {
+      return { ok: true, value: JSON.parse(repaired) as SynthesisValue };
+    } catch (secondErr) {
+      return {
+        ok: false,
+        error: `raw parse failed (${(firstErr as Error).message}); ` +
+          `repair parse failed (${(secondErr as Error).message}); ` +
+          `head=${cleaned.slice(0, 80).replace(/\s+/g, " ")}`,
+      };
+    }
+  }
+}
+
+/**
+ * Best-effort repair of a JSON string that the model truncated mid-write.
+ *
+ * Strategy: walk char-by-char, tracking whether we're inside a string.
+ * When we hit EOF mid-string, close it. Then count `{` and `}` and
+ * append the missing closers. This handles the most common case where
+ * the model ran out of output tokens on the last `niceToHave` entry.
+ */
+function attemptRepair(raw: string): string {
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i]!;
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (c === "\\") {
+      escape = true;
+      continue;
+    }
+    if (c === '"') {
+      inString = !inString;
+    }
+  }
+  let s = raw;
+  if (inString) s += '"';
+  // Strip a trailing comma so the JSON is well-formed after a close.
+  s = s.replace(/,\s*$/, "");
+  // Balance braces/brackets.
+  const opens: string[] = [];
+  let inStr2 = false;
+  let esc2 = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]!;
+    if (esc2) {
+      esc2 = false;
+      continue;
+    }
+    if (c === "\\") {
+      esc2 = true;
+      continue;
+    }
+    if (c === '"') {
+      inStr2 = !inStr2;
+      continue;
+    }
+    if (inStr2) continue;
+    if (c === "{" || c === "[") opens.push(c);
+    else if (c === "}" || c === "]") opens.pop();
+  }
+  // `opens` now contains all unclosed openers in order; we close them
+  // in reverse to produce a valid suffix.
+  const closers = opens.reverse().map((o) => (o === "{" ? "}" : "]")).join("");
+  return s + closers;
+}
+
+/**
+ * Last-resort benchmark built from the role string itself, with no
+ * assumed skills. The structured sub-agents (roadmap / gaps / readiness)
+ * will still run and will give the user a useful answer grounded in
+ * their CV + the role title. Better than silently dropping the user
+ * into general chat.
+ */
+function buildHeuristicBenchmark(roleInput: string): RoleBenchmark {
+  const slug = slugifyRole(roleInput);
+  return {
+    key: DYNAMIC_PREFIX + (slug || "custom-role"),
+    title: roleInput,
+    summary: `Custom role: ${roleInput}. Heuristic profile (synthesis unavailable).`,
+    domain: "Custom",
+    mustHave: [],
+    niceToHave: [],
+    minExperienceYears: 1,
+    minEducation: "bachelor",
+    keywords: slug ? slug.split("-") : [roleInput.toLowerCase()],
+    notes:
+      "Heuristic fallback used when dynamic synthesis returned malformed JSON. " +
+      "Has no must-have skills, so the fit-score engine will use the user's full CV " +
+      "as the basis for any role-specific advice.",
+  };
 }

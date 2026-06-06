@@ -39,7 +39,12 @@ function rowToResult(row: Record<string, unknown>): HunterResult & { cachedAt: s
 // ---------- GET (list) ----------
 
 export async function GET() {
-  const userId = await requireUserId();
+  let userId: string;
+  try {
+    userId = await requireUserId();
+  } catch (r) {
+    return r as Response;
+  }
   const sb = supabaseAdmin;
   const { data, error } = await sb
     .from("hunter_hunts")
@@ -54,7 +59,12 @@ export async function GET() {
 // ---------- POST (run) ----------
 
 export async function POST(req: NextRequest) {
-  const userId = await requireUserId();
+  let userId: string;
+  try {
+    userId = await requireUserId();
+  } catch (r) {
+    return r as Response;
+  }
 
   let body: { query?: string; forceRefresh?: boolean };
   try {

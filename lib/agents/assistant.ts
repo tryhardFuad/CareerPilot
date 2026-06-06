@@ -1,45 +1,16 @@
 /**
  * Assistant agent — the intent router that powers Pillar 3.
- *
- * The chat route calls `runAssistant({ userId, message, history, intentHint })`.
- * It returns a structured `AssistantResponse` whose `mode` field tells the
- * client which renderer to use (chip results, chat text, structured card).
- *
- * Five modes:
- *
- *   - "readiness"    → user's overall readiness for a role they specify
- *                       (e.g. "am I ready for a Google SWE internship?")
- *                       Calls scoreFitScore(benchmarkKey=userRole).
- *
- *   - "gap_analysis" → "what am I missing for {role}?"  → fit-score with
- *                       strong emphasis on the `missing` list and a Gemini
- *                       plan to close the top 3 gaps.
- *
- *   - "roadmap"      → "build me a 6-week plan to become a {role}"  →
- *                       gap analysis + a Gemini-generated weekly plan.
- *
- *   - "cover_letter" → "draft a cover letter for {role} at {company}"  →
- *                       fit-score (for strengths to highlight) + Gemini
- *                       draft in the requested tone/length.
- *
- *   - "general"      → fallback: existing RAG chat with persona prompt.
- *
- * The specialised modes all share `scoreFitScore` as the scoring engine.
- * They differ only in (a) the system prompt and (b) the final Gemini call
- * that turns the structured score into the user-facing message.
  */
 
 import { SchemaType, type Schema } from "@google/generative-ai";
 import { chatComplete } from "@/lib/ai/provider";
 import {
   scoreFitScore,
-  type FitScoreResult,
+  type FitScoreResult as EngineFitScore,
   type ScoredSkill,
 } from "@/lib/agents/fitScore";
 import { BENCHMARKS, BENCHMARK_LIST, type RoleBenchmark } from "@/lib/data/benchmarks";
 import { getOrSynthesiseBenchmark } from "@/lib/data/benchmarks/dynamic";
-
-// ---------- Public types ----------
 
 export type AssistantIntent =
   | "readiness"
@@ -48,57 +19,88 @@ export type AssistantIntent =
   | "cover_letter"
   | "general";
 
+export type AssistantTone = "professional" | "friendly" | "enthusiastic";
+
 export interface AssistantInput {
   userId: string;
   message: string;
-  /** Recent chat turns (oldest first) for context in the general fallback. */
   history?: { role: "user" | "model"; content: string }[];
-  /**
-   * When set by a UI chip, skip classification and route directly to the
-   * matching sub-agent. The chip also pre-fills any structured fields.
-   */
   intentHint?: AssistantIntent;
-  /** Optional structured inputs from a chip. */
   hints?: {
     benchmarkKey?: string;
-    /**
-     * Free-text role the user typed (e.g. "MLOps Engineer at a fintech").
-     * If `benchmarkKey` doesn't match a static role, this is used to
-     * synthesise a benchmark on the fly. Mutually exclusive with
-     * `benchmark` — if both are set, `benchmark` wins.
-     */
     role?: string;
-    /** Pre-resolved benchmark; callers that already have one can pass it. */
     benchmark?: RoleBenchmark;
     weeks?: number;
-    tone?: "professional" | "friendly" | "enthusiastic";
+    tone?: AssistantTone;
     company?: string;
   };
 }
+
+export interface FitScoreResult {
+  band: "strong" | "moderate" | "weak";
+  label: string;
+  score: number;
+}
+
+export type StructuredPayload =
+  | {
+      kind: "readiness";
+      benchmarkTitle: string;
+      overall: FitScoreResult;
+      summary: string;
+      buckets: { id: string; label: string; score: FitScoreResult; rationale: string }[];
+    }
+  | {
+      kind: "gap_analysis";
+      benchmarkTitle: string;
+      overall: FitScoreResult;
+      summary: string;
+      missing: { skill: string; priority: 1 | 2 | 3 | 4 | 5; reason: string; evidence?: string }[];
+    }
+  | {
+      kind: "roadmap";
+      benchmarkTitle: string;
+      weeks: number;
+      overall: FitScoreResult;
+      summary: string;
+      weeks_plan: { week: number; focus: string; tasks: string[] }[];
+    }
+  | {
+      kind: "cover_letter";
+      benchmarkTitle: string;
+      company?: string;
+      tone: AssistantTone;
+      summary: string;
+      body: string;
+    };
 
 export type AssistantResponse =
   | {
       mode: "readiness";
       message: string;
-      fitScore: FitScoreResult;
+      fitScore: EngineFitScore;
+      structured: Extract<StructuredPayload, { kind: "readiness" }>;
     }
   | {
       mode: "gap_analysis";
       message: string;
-      fitScore: FitScoreResult;
+      fitScore: EngineFitScore;
+      structured: Extract<StructuredPayload, { kind: "gap_analysis" }>;
     }
   | {
       mode: "roadmap";
       message: string;
-      fitScore: FitScoreResult;
+      fitScore: EngineFitScore;
       weeks: number;
+      structured: Extract<StructuredPayload, { kind: "roadmap" }>;
     }
   | {
       mode: "cover_letter";
       message: string;
-      fitScore: FitScoreResult;
-      tone: NonNullable<AssistantInput["hints"]>["tone"];
+      fitScore: EngineFitScore;
+      tone: AssistantTone;
       company?: string;
+      structured: Extract<StructuredPayload, { kind: "cover_letter" }>;
     }
   | {
       mode: "general";
@@ -106,7 +108,24 @@ export type AssistantResponse =
       citations: { id: string; source: string; text: string; score: number }[];
     };
 
-// ---------- Intent classification ----------
+function bandFromVerdict(verdict: EngineFitScore["verdict"]): FitScoreResult["band"] {
+  if (verdict === "strong" || verdict === "good") return "strong";
+  if (verdict === "borderline") return "moderate";
+  return "weak";
+}
+
+function labelFromVerdict(verdict: EngineFitScore["verdict"], score: number): string {
+  const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+  return `${cap(verdict)} · ${score}/100`;
+}
+
+function projectOverall(fit: EngineFitScore): FitScoreResult {
+  return {
+    band: bandFromVerdict(fit.verdict),
+    label: labelFromVerdict(fit.verdict, fit.score),
+    score: fit.score,
+  };
+}
 
 const CLASSIFY_SCHEMA: Schema = {
   type: SchemaType.OBJECT,
@@ -115,28 +134,26 @@ const CLASSIFY_SCHEMA: Schema = {
       type: SchemaType.STRING,
       format: "enum",
       enum: ["readiness", "gap_analysis", "roadmap", "cover_letter", "general"],
-      description:
-        "Classify the user's message into one of the five assistant modes.",
+      description: "Classify the user's message into one of the five assistant modes.",
     },
     benchmarkKey: {
       type: SchemaType.STRING,
       description:
-        "If the user names a role, return its benchmark key (e.g. 'data-engineer'). " +
-        "If none of the benchmarks match, return ''.",
+        "If the user names a role, return its benchmark key. If none match, return ''.",
     },
     weeks: {
       type: SchemaType.INTEGER,
-      description: "For roadmap mode, the number of weeks the user requested. Default 6.",
+      description: "For roadmap mode, weeks requested. Default 6.",
     },
     tone: {
       type: SchemaType.STRING,
       format: "enum",
       enum: ["professional", "friendly", "enthusiastic"],
-      description: "For cover-letter mode, the requested tone. Default professional.",
+      description: "Cover-letter tone. Default professional.",
     },
     company: {
       type: SchemaType.STRING,
-      description: "For cover-letter mode, the company name if mentioned.",
+      description: "Cover-letter company if mentioned.",
     },
   },
   required: ["intent"],
@@ -152,7 +169,7 @@ async function classifyIntent(
   intent: AssistantIntent;
   benchmarkKey?: string;
   weeks?: number;
-  tone?: NonNullable<AssistantInput["hints"]>["tone"];
+  tone?: AssistantTone;
   company?: string;
 }> {
   const prompt =
@@ -172,10 +189,9 @@ async function classifyIntent(
       intent: AssistantIntent;
       benchmarkKey?: string;
       weeks?: number;
-      tone?: NonNullable<AssistantInput["hints"]>["tone"];
+      tone?: AssistantTone;
       company?: string;
     };
-    // Sanitise: only return a benchmark key that actually exists.
     const benchmarkKey =
       parsed.benchmarkKey && BENCHMARKS[parsed.benchmarkKey]
         ? parsed.benchmarkKey
@@ -183,7 +199,10 @@ async function classifyIntent(
     return {
       intent: parsed.intent ?? "general",
       ...(benchmarkKey ? { benchmarkKey } : {}),
-      weeks: typeof parsed.weeks === "number" ? Math.max(1, Math.min(52, parsed.weeks)) : undefined,
+      weeks:
+        typeof parsed.weeks === "number"
+          ? Math.max(1, Math.min(52, parsed.weeks))
+          : undefined,
       tone: parsed.tone,
       company: parsed.company?.trim() || undefined,
     };
@@ -191,8 +210,6 @@ async function classifyIntent(
     return { intent: "general" };
   }
 }
-
-// ---------- Entity extraction helpers ----------
 
 function pickBenchmarkKey(
   hint: AssistantInput["hints"] | undefined,
@@ -203,15 +220,6 @@ function pickBenchmarkKey(
   return undefined;
 }
 
-/**
- * Resolve the benchmark for a specialised chip. Order of precedence:
- *   1. Inline `hints.benchmark` (caller already resolved it).
- *   2. Static `hints.benchmarkKey` (one of the 4 curated roles).
- *   3. Free-text `hints.role` — synthesise on the fly via Gemini.
- *   4. The classifier's `benchmarkKey` (if it matched a static role).
- * Returns null if none could be resolved; the caller should fall back
- * to general chat in that case.
- */
 async function resolveBenchmark(
   userId: string,
   hints: AssistantInput["hints"] | undefined,
@@ -224,7 +232,6 @@ async function resolveBenchmark(
     try {
       return await getOrSynthesiseBenchmark(userId, hints.role);
     } catch (err) {
-      // Synthesis failed — caller will fall back to general chat.
       console.warn("[assistant] dynamic benchmark synthesis failed", err);
       return null;
     }
@@ -232,7 +239,7 @@ async function resolveBenchmark(
   return null;
 }
 
-function summariseFitScore(fit: FitScoreResult): string {
+function summariseFitScore(fit: EngineFitScore): string {
   const matched = fit.matched.map((m) => m.skill.label).join(", ") || "none";
   const missing = fit.missing.map((m) => m.skill.label).join(", ") || "none";
   return [
@@ -244,8 +251,6 @@ function summariseFitScore(fit: FitScoreResult): string {
   ].join("\n");
 }
 
-// ---------- Sub-agent: readiness ----------
-
 const READINESS_SCHEMA: Schema = {
   type: SchemaType.OBJECT,
   properties: {
@@ -253,22 +258,29 @@ const READINESS_SCHEMA: Schema = {
       type: SchemaType.STRING,
       format: "enum",
       enum: ["ready_now", "ready_in_weeks", "not_yet"],
-      description: "Honest verdict on the user's readiness.",
     },
-    weeksToReady: {
-      type: SchemaType.INTEGER,
-      description: "Estimated weeks until the user is competitive.",
-    },
-    headline: {
-      type: SchemaType.STRING,
-      description: "One bold sentence summarising the verdict.",
-    },
-    nextAction: {
-      type: SchemaType.STRING,
-      description: "The single most impactful next action.",
+    weeksToReady: { type: SchemaType.INTEGER },
+    headline: { type: SchemaType.STRING },
+    nextAction: { type: SchemaType.STRING },
+    buckets: {
+      type: SchemaType.ARRAY,
+      items: {
+        type: SchemaType.OBJECT,
+        properties: {
+          id: { type: SchemaType.STRING },
+          label: { type: SchemaType.STRING },
+          verdict: {
+            type: SchemaType.STRING,
+            format: "enum",
+            enum: ["strong", "good", "borderline", "weak"],
+          },
+          rationale: { type: SchemaType.STRING },
+        },
+        required: ["id", "label", "verdict", "rationale"],
+      },
     },
   },
-  required: ["verdict", "headline", "nextAction"],
+  required: ["verdict", "headline", "nextAction", "buckets"],
 };
 
 async function runReadiness(
@@ -278,22 +290,25 @@ async function runReadiness(
 ): Promise<AssistantResponse & { mode: "readiness" }> {
   const fit = await scoreFitScore({ userId, benchmark });
   const raw = await chatComplete(
-    [{ role: "user", parts:
-      `The user asks: "${message}"\n\n` +
-      `Role: ${benchmark.title} (${benchmark.summary})\n` +
-      `Fit-score summary:\n${summariseFitScore(fit)}`,
-    }],
+    [
+      {
+        role: "user",
+        parts:
+          `The user asks: "${message}"\n\n` +
+          `Role: ${benchmark.title} (${benchmark.summary})\n` +
+          `Fit-score summary:\n${summariseFitScore(fit)}`,
+      },
+    ],
     {
       tier: "quality",
       systemInstruction:
         "You are a sharp, action-oriented career coach. " +
-        "Be honest about readiness — do not flatter. " +
-        "Use the fit-score data verbatim where helpful. " +
+        "Be honest about readiness. Use the fit-score data verbatim where helpful. " +
         "If the user is not yet ready, name the top blocker and a concrete next step. " +
         "Return only the JSON described in the schema.",
       generationConfig: {
         temperature: 0.4,
-        maxOutputTokens: 512,
+        maxOutputTokens: 700,
         responseMimeType: "application/json",
         responseSchema: READINESS_SCHEMA,
       },
@@ -304,33 +319,62 @@ async function runReadiness(
     weeksToReady?: number;
     headline: string;
     nextAction: string;
+    buckets: {
+      id: string;
+      label: string;
+      verdict: EngineFitScore["verdict"];
+      rationale: string;
+    }[];
   };
+  const overall = projectOverall(fit);
   const messageText =
     `**${parsed.headline}**\n\n` +
     `Verdict: ${parsed.verdict.replace("_", " ")}` +
     (parsed.weeksToReady ? ` · ~${parsed.weeksToReady} weeks to ready` : "") +
     `\n\n**Next action:** ${parsed.nextAction}`;
-  return { mode: "readiness", message: messageText, fitScore: fit };
+  const buckets = (parsed.buckets ?? []).map((b) => {
+    const score: number =
+      b.verdict === "strong" ? 90 : b.verdict === "good" ? 75 : b.verdict === "borderline" ? 55 : 30;
+    return {
+      id: b.id,
+      label: b.label,
+      score: {
+        band: bandFromVerdict(b.verdict),
+        label: labelFromVerdict(b.verdict, score),
+        score,
+      } satisfies FitScoreResult,
+      rationale: b.rationale,
+    };
+  });
+  const structured: Extract<StructuredPayload, { kind: "readiness" }> = {
+    kind: "readiness",
+    benchmarkTitle: benchmark.title,
+    overall,
+    summary: messageText,
+    buckets,
+  };
+  return { mode: "readiness", message: messageText, fitScore: fit, structured };
 }
-
-// ---------- Sub-agent: gap analysis ----------
 
 const GAP_SCHEMA: Schema = {
   type: SchemaType.OBJECT,
   properties: {
-    summary: { type: SchemaType.STRING, description: "One-line summary of the gap." },
+    summary: { type: SchemaType.STRING },
     topGaps: {
       type: SchemaType.ARRAY,
-      items: { type: SchemaType.STRING },
-      description: "Top 3-5 skills to close, most impactful first.",
-    },
-    actions: {
-      type: SchemaType.ARRAY,
-      items: { type: SchemaType.STRING },
-      description: "Concrete actions per gap (1-2 each).",
+      items: {
+        type: SchemaType.OBJECT,
+        properties: {
+          skill: { type: SchemaType.STRING },
+          priority: { type: SchemaType.INTEGER },
+          reason: { type: SchemaType.STRING },
+          evidence: { type: SchemaType.STRING },
+        },
+        required: ["skill", "priority", "reason"],
+      },
     },
   },
-  required: ["summary", "topGaps", "actions"],
+  required: ["summary", "topGaps"],
 };
 
 async function runGapAnalysis(
@@ -340,19 +384,24 @@ async function runGapAnalysis(
 ): Promise<AssistantResponse & { mode: "gap_analysis" }> {
   const fit = await scoreFitScore({ userId, benchmark });
   const raw = await chatComplete(
-    [{ role: "user", parts:
-      `The user asks: "${message}"\n\n` +
-      `Role: ${benchmark.title} (${benchmark.summary})\n` +
-      `Fit-score summary:\n${summariseFitScore(fit)}\n\n` +
-      `Focus on the missing must-have skills. Return JSON.`,
-    }],
+    [
+      {
+        role: "user",
+        parts:
+          `The user asks: "${message}"\n\n` +
+          `Role: ${benchmark.title} (${benchmark.summary})\n` +
+          `Fit-score summary:\n${summariseFitScore(fit)}\n\n` +
+          `Focus on the missing must-have skills. Return JSON.`,
+      },
+    ],
     {
       tier: "quality",
       systemInstruction:
         "You are a pragmatic career coach. " +
         "Identify the top 3-5 skills the user must close to become competitive. " +
-        "Pair each gap with a concrete action (course, project, cert). " +
-        "Be specific — no fluff like 'learn more about X'.",
+        "For each gap, give it a priority 1-5 (1 = most important) and one-sentence reason. " +
+        "If the user has evidence of being close, include a short 'evidence' string. " +
+        "Return only the JSON described in the schema.",
       generationConfig: {
         temperature: 0.4,
         maxOutputTokens: 700,
@@ -361,23 +410,38 @@ async function runGapAnalysis(
       },
     },
   );
-  const parsed = JSON.parse(raw) as { summary: string; topGaps: string[]; actions: string[] };
+  const parsed = JSON.parse(raw) as {
+    summary: string;
+    topGaps: { skill: string; priority: number; reason: string; evidence?: string }[];
+  };
+  const overall = projectOverall(fit);
+  const missing: Extract<StructuredPayload, { kind: "gap_analysis" }>["missing"] = (
+    parsed.topGaps ?? []
+  ).map((g) => ({
+    skill: g.skill,
+    priority: Math.max(1, Math.min(5, Math.round(g.priority))) as 1 | 2 | 3 | 4 | 5,
+    reason: g.reason,
+    ...(g.evidence ? { evidence: g.evidence } : {}),
+  }));
   const text =
     `**${parsed.summary}**\n\n` +
     `**Top gaps to close:**\n` +
-    parsed.topGaps.map((g, i) => `${i + 1}. ${g}`).join("\n") +
-    `\n\n**How to close them:**\n` +
-    parsed.actions.map((a, i) => `${i + 1}. ${a}`).join("\n") +
+    missing.map((m, i) => `${i + 1}. ${m.skill}`).join("\n") +
     `\n\n*Fit score: ${fit.score}/100 — ${fit.verdict}*`;
-  return { mode: "gap_analysis", message: text, fitScore: fit };
+  const structured: Extract<StructuredPayload, { kind: "gap_analysis" }> = {
+    kind: "gap_analysis",
+    benchmarkTitle: benchmark.title,
+    overall,
+    summary: parsed.summary,
+    missing,
+  };
+  return { mode: "gap_analysis", message: text, fitScore: fit, structured };
 }
-
-// ---------- Sub-agent: roadmap ----------
 
 const ROADMAP_SCHEMA: Schema = {
   type: SchemaType.OBJECT,
   properties: {
-    overview: { type: SchemaType.STRING, description: "One-sentence plan overview." },
+    overview: { type: SchemaType.STRING },
     weeks: {
       type: SchemaType.ARRAY,
       items: {
@@ -386,7 +450,7 @@ const ROADMAP_SCHEMA: Schema = {
           week: { type: SchemaType.INTEGER },
           theme: { type: SchemaType.STRING },
           deliverables: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING } },
-          hours: { type: SchemaType.INTEGER, description: "Suggested weekly hours." },
+          hours: { type: SchemaType.INTEGER },
         },
         required: ["week", "theme", "deliverables", "hours"],
       },
@@ -403,14 +467,18 @@ async function runRoadmap(
 ): Promise<AssistantResponse & { mode: "roadmap" }> {
   const fit = await scoreFitScore({ userId, benchmark });
   const raw = await chatComplete(
-    [{ role: "user", parts:
-      `The user asks: "${message}"\n\n` +
-      `Role: ${benchmark.title}\n` +
-      `Plan length: ${weeks} weeks\n` +
-      `Missing must-haves: ${fit.missing.map((m: ScoredSkill) => m.skill.label).join(", ")}\n` +
-      `Existing strengths: ${fit.matched.map((m: ScoredSkill) => m.skill.label).join(", ")}\n\n` +
-      `Build a ${weeks}-week plan that closes the top gaps first, then layers on nice-to-haves.`,
-    }],
+    [
+      {
+        role: "user",
+        parts:
+          `The user asks: "${message}"\n\n` +
+          `Role: ${benchmark.title}\n` +
+          `Plan length: ${weeks} weeks\n` +
+          `Missing must-haves: ${fit.missing.map((m: ScoredSkill) => m.skill.label).join(", ")}\n` +
+          `Existing strengths: ${fit.matched.map((m: ScoredSkill) => m.skill.label).join(", ")}\n\n` +
+          `Build a ${weeks}-week plan that closes the top gaps first, then layers on nice-to-haves.`,
+      },
+    ],
     {
       tier: "quality",
       systemInstruction:
@@ -431,6 +499,15 @@ async function runRoadmap(
     overview: string;
     weeks: { week: number; theme: string; deliverables: string[]; hours: number }[];
   };
+  const overall = projectOverall(fit);
+  const weeks_plan: Extract<StructuredPayload, { kind: "roadmap" }>["weeks_plan"] = (
+    parsed.weeks ?? []
+  ).map((w) => ({
+    week: w.week,
+    focus: w.theme,
+    tasks: (w.deliverables ?? []).slice(0, 3),
+  }));
+  const summary = parsed.overview;
   const text =
     `**${parsed.overview}**\n\n` +
     parsed.weeks
@@ -441,16 +518,22 @@ async function runRoadmap(
       )
       .join("\n\n") +
     `\n\n*Target role: ${benchmark.title} · Starting fit: ${fit.score}/100*`;
-  return { mode: "roadmap", message: text, fitScore: fit, weeks };
+  const structured: Extract<StructuredPayload, { kind: "roadmap" }> = {
+    kind: "roadmap",
+    benchmarkTitle: benchmark.title,
+    weeks,
+    overall,
+    summary,
+    weeks_plan,
+  };
+  return { mode: "roadmap", message: text, fitScore: fit, weeks, structured };
 }
-
-// ---------- Sub-agent: cover letter ----------
 
 const COVER_LETTER_SCHEMA: Schema = {
   type: SchemaType.OBJECT,
   properties: {
     subject: { type: SchemaType.STRING },
-    body: { type: SchemaType.STRING, description: "Plain-text cover letter, ~250-350 words." },
+    body: { type: SchemaType.STRING },
   },
   required: ["subject", "body"],
 };
@@ -458,36 +541,36 @@ const COVER_LETTER_SCHEMA: Schema = {
 async function runCoverLetter(
   userId: string,
   benchmark: RoleBenchmark,
-  tone: NonNullable<AssistantInput["hints"]>["tone"],
+  tone: AssistantTone,
   company: string | undefined,
   message: string,
 ): Promise<AssistantResponse & { mode: "cover_letter" }> {
   const fit = await scoreFitScore({ userId, benchmark });
   const companyLine = company ? `Target company: ${company}\n` : "";
-  // Target word count is intentional — keeps the model focused and avoids
-  // silent truncation. 1200 tokens is enough headroom for a 320-word letter
-  // plus JSON wrapping and the subject line, even with marker bloat.
   const WORD_TARGET = 320;
   const raw = await chatComplete(
-    [{ role: "user", parts:
-      `The user asks: "${message}"\n\n` +
-      `Role: ${benchmark.title} (${benchmark.summary})\n` +
-      `${companyLine}` +
-      `Tone: ${tone}\n` +
-      `Strengths to lead with: ${fit.matched.slice(0, 5).map((m) => m.skill.label).join(", ")}\n` +
-      `Experience: ${fit.experience.inferredYears}y\n` +
-      `Rationale: ${fit.rationale}\n\n` +
-      `Write a ${tone} cover letter, exactly ~${WORD_TARGET} words (range 280-340). ` +
-      `Open with a specific, non-generic hook tied to the role or company. ` +
-      `Lead with the user's top strengths. Do NOT mention the fit score. ` +
-      `End with a confident, specific sign-off (no placeholder placeholders).`,
-    }],
+    [
+      {
+        role: "user",
+        parts:
+          `The user asks: "${message}"\n\n` +
+          `Role: ${benchmark.title} (${benchmark.summary})\n` +
+          `${companyLine}` +
+          `Tone: ${tone}\n` +
+          `Strengths to lead with: ${fit.matched.slice(0, 5).map((m) => m.skill.label).join(", ")}\n` +
+          `Experience: ${fit.experience.inferredYears}y\n` +
+          `Rationale: ${fit.rationale}\n\n` +
+          `Write a ${tone} cover letter, exactly ~${WORD_TARGET} words (range 280-340). ` +
+          `Open with a specific, non-generic hook tied to the role or company. ` +
+          `Lead with the user's top strengths. Do NOT mention the fit score. ` +
+          `End with a confident, specific sign-off.`,
+      },
+    ],
     {
       tier: "quality",
       systemInstruction:
         "You write cover letters that don't sound like cover letters. " +
-        "Avoid clichés ('I am writing to apply', 'passionate about', 'I would be a great fit'). " +
-        "Use the user's strengths as concrete evidence. " +
+        "Avoid clichés. Use the user's strengths as concrete evidence. " +
         `Hit approximately ${WORD_TARGET} words. Finish every sentence — never stop mid-thought.`,
       generationConfig: {
         temperature: 0.7,
@@ -498,38 +581,45 @@ async function runCoverLetter(
     },
   );
   const parsed = JSON.parse(raw) as { subject: string; body: string };
-  // Sanity-check: if the model came back with a letter that ends mid-sentence
-  // (no terminal punctuation, last word clipped) we surface a soft warning in
-  // the persisted message so the UI can hint at a retry.
   const body = parsed.body?.trim() ?? "";
   const endsCleanly = /[.!?\"]\s*$/.test(body);
   const warning = endsCleanly
     ? ""
     : "\n\n*(This draft may be truncated. Click Run again to regenerate.)*";
+  const overall = projectOverall(fit);
+  const summary = `Tailored ${tone} cover letter for the ${benchmark.title} role${
+    company ? ` at ${company}` : ""
+  }.`;
   const text = `**Subject:** ${parsed.subject}\n\n${body}${warning}`;
+  const structured: Extract<StructuredPayload, { kind: "cover_letter" }> = {
+    kind: "cover_letter",
+    benchmarkTitle: benchmark.title,
+    ...(company ? { company } : {}),
+    tone,
+    summary,
+    body,
+  };
   return {
     mode: "cover_letter",
     message: text,
     fitScore: fit,
     tone,
     ...(company ? { company } : {}),
+    structured,
   };
 }
-
-// ---------- Sub-agent: general chat (RAG fallback) ----------
 
 async function runGeneralChat(
   userId: string,
   message: string,
   history: AssistantInput["history"],
-  retrieveCvChunks: (userId: string, query: string) => Promise<
-    { id: string; source: string; text: string; score: number }[]
-  >,
+  retrieveCvChunks: (
+    userId: string,
+    query: string,
+  ) => Promise<{ id: string; source: string; text: string; score: number }[]>,
 ): Promise<AssistantResponse & { mode: "general" }> {
   const citations = await retrieveCvChunks(userId, message);
-  const ctxLines = citations
-    .map((c) => `[${c.id}] ${c.source}: ${c.text}`)
-    .join("\n\n");
+  const ctxLines = citations.map((c) => `[${c.id}] ${c.source}: ${c.text}`).join("\n\n");
   const messages = [
     ...(history ?? []).map((h) => ({ role: h.role, parts: h.content })),
     {
@@ -550,7 +640,7 @@ async function runGeneralChat(
   return { mode: "general", message: reply, citations };
 }
 
-// ---------- Main entry point ----------
+type SpecialisedIntent = Exclude<AssistantIntent, "general">;
 
 export async function runAssistant(
   input: AssistantInput,
@@ -561,11 +651,10 @@ export async function runAssistant(
 ): Promise<AssistantResponse> {
   const { userId, message, history, intentHint, hints } = input;
 
-  // Resolve intent + structured fields.
   let intent: AssistantIntent = intentHint ?? "general";
   let classifiedKey: string | undefined;
-  let weeks = hints?.weeks ?? 6;
-  let tone = hints?.tone ?? "professional";
+  let weeks: number = hints?.weeks ?? 6;
+  const tone: AssistantTone = hints?.tone ?? "professional";
   let company: string | undefined = hints?.company;
 
   if (!intentHint) {
@@ -573,50 +662,27 @@ export async function runAssistant(
     intent = classified.intent;
     classifiedKey = classified.benchmarkKey;
     if (classified.weeks) weeks = classified.weeks;
-    if (classified.tone) tone = classified.tone;
     if (classified.company) company = classified.company;
   }
 
-  // General chat — no benchmark needed.
   if (intent === "general") {
     return runGeneralChat(userId, message, history, retrieveCvChunks);
   }
 
-  // Specialised modes need a benchmark. Resolution chain (in order):
-  //   inline > static key > synthesise from free-text role.
   const benchmark = await resolveBenchmark(userId, hints, classifiedKey);
   if (!benchmark) {
     return runGeneralChat(userId, message, history, retrieveCvChunks);
   }
 
-  return dispatchSpecialised(
-    userId, message, benchmark, weeks, tone, company, retrieveCvChunks,
-  );
-}
-
-function dispatchSpecialised(
-  userId: string,
-  message: string,
-  benchmark: RoleBenchmark,
-  weeks: number,
-  tone: NonNullable<AssistantInput["hints"]>["tone"],
-  company: string | undefined,
-  retrieveCvChunks: (
-    userId: string,
-    query: string,
-  ) => Promise<{ id: string; source: string; text: string; score: number }[]>,
-): Promise<AssistantResponse> {
-  switch (true) {
-    case message.toLowerCase().includes("roadmap") ||
-         message.toLowerCase().includes("plan") ||
-         message.toLowerCase().includes("week"):
+  const specialised: SpecialisedIntent = intent;
+  switch (specialised) {
+    case "roadmap":
       return runRoadmap(userId, benchmark, weeks, message);
-    case message.toLowerCase().includes("cover letter"):
-      return runCoverLetter(userId, benchmark, tone, company, message);
-    case message.toLowerCase().includes("gap") ||
-         message.toLowerCase().includes("missing"):
+    case "gap_analysis":
       return runGapAnalysis(userId, benchmark, message);
-    default:
+    case "cover_letter":
+      return runCoverLetter(userId, benchmark, tone, company, message);
+    case "readiness":
       return runReadiness(userId, benchmark, message);
   }
 }
