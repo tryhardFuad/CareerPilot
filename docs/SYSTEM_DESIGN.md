@@ -9,10 +9,9 @@
 
 ### Goals
 1. **CV is the single source of truth.** Every AI surface (Hunter prompt, Assistant, Fit-score) is grounded in the user's own CV vectors. No generic LLM priors.
-2. **Sub-second perceived latency** for chat and tracker interactions.
-3. **Single user, single deploy, multi-pillar.** One Next.js app, one Supabase project, one auth provider.
-4. **Auditable, repairable AI outputs.** Fit-score is programmatic (weighted formula). Assistant responses carry citations and a structured payload.
-5. **Cheap to run.** Target < **\$0.10 / active user / month** at 1k MAU.
+2. **Single user, single deploy, multi-pillar.** One Next.js app, one Supabase project, one auth provider.
+3. **Auditable, repairable AI outputs.** Fit-score is programmatic (weighted formula). Assistant responses carry citations and a structured payload.
+4. **Cheap to run.** Target < **\$0.10 / active user / month** at 1k MAU.
 
 ### Non-goals
 - Background job system (CV ingest is synchronous; reasoning in §6).
