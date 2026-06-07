@@ -104,8 +104,22 @@ export async function POST(
       (uid, q) => retrieveCvChunks(uid, q).then(toRouterCitations),
     );
   } catch (err) {
-    const msg = err instanceof Error ? err.message : "Assistant call failed";
-    return NextResponse.json({ error: msg }, { status: 502 });
+    // The throw could come from anywhere — model fallback chain exhausted,
+    // a raw JSON.parse on a truncated LLM reply, a Supabase RLS rejection.
+    // We coerce the message to a safe string so the 502 body itself is
+    // always valid JSON, even if the underlying error mentions a
+    // JSON.parse diagnostic like "Unterminated string in JSON at position 68".
+    const raw =
+      err instanceof Error ? err.message : "Assistant call failed";
+    // Strip characters that would break the JSON body if embedded raw.
+    // (Quotes, newlines, control chars.) The body is always
+    // { "error": "<safe string>" }.
+    const safe = String(raw).replace(/[\r\n\t"\\]/g, " ").slice(0, 500);
+    console.error("[chat/threads/messages] runAssistant threw:", err);
+    return NextResponse.json(
+      { error: safe, code: "assistant_failed" },
+      { status: 502 },
+    );
   }
 
   // 5) Build the persistence payload. The DB column `mode` is the

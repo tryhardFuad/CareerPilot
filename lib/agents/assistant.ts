@@ -31,6 +31,7 @@
 
 import { SchemaType, type Schema } from "@google/generative-ai";
 import { chatComplete } from "@/lib/ai/provider";
+import { parseJsonSafe } from "@/lib/ai/parse-json";
 import {
   scoreFitScore,
   type FitScoreResult,
@@ -168,13 +169,23 @@ async function classifyIntent(
         responseSchema: CLASSIFY_SCHEMA,
       },
     });
-    const parsed = JSON.parse(raw) as {
-      intent: AssistantIntent;
-      benchmarkKey?: string;
-      weeks?: number;
-      tone?: NonNullable<AssistantInput["hints"]>["tone"];
-      company?: string;
-    };
+    const parsed =
+      parseJsonSafe<{
+        intent: AssistantIntent;
+        benchmarkKey?: string;
+        weeks?: number;
+        tone?: NonNullable<AssistantInput["hints"]>["tone"];
+        company?: string;
+      }>(raw) ??
+      ({
+        intent: "general" as const,
+      } as {
+        intent: AssistantIntent;
+        benchmarkKey?: string;
+        weeks?: number;
+        tone?: NonNullable<AssistantInput["hints"]>["tone"];
+        company?: string;
+      });
     // Sanitise: only return a benchmark key that actually exists.
     const benchmarkKey =
       parsed.benchmarkKey && BENCHMARKS[parsed.benchmarkKey]
@@ -299,12 +310,18 @@ async function runReadiness(
       },
     },
   );
-  const parsed = JSON.parse(raw) as {
-    verdict: "ready_now" | "ready_in_weeks" | "not_yet";
-    weeksToReady?: number;
-    headline: string;
-    nextAction: string;
-  };
+  const parsed =
+    parseJsonSafe<{
+      verdict: "ready_now" | "ready_in_weeks" | "not_yet";
+      weeksToReady?: number;
+      headline: string;
+      nextAction: string;
+    }>(raw) ?? {
+      verdict: "not_yet" as const,
+      headline: "Readiness summary unavailable",
+      nextAction:
+        "Your fit-score is computed — try the Roadmap or Gap analysis chip to plan your next step.",
+    };
   const messageText =
     `**${parsed.headline}**\n\n` +
     `Verdict: ${parsed.verdict.replace("_", " ")}` +
@@ -361,7 +378,14 @@ async function runGapAnalysis(
       },
     },
   );
-  const parsed = JSON.parse(raw) as { summary: string; topGaps: string[]; actions: string[] };
+  const parsed =
+    parseJsonSafe<{ summary: string; topGaps: string[]; actions: string[] }>(raw) ?? {
+      summary: "Gap analysis unavailable",
+      topGaps: fit.missing.slice(0, 3).map((m) => m.skill.label),
+      actions: fit.missing
+        .slice(0, 3)
+        .map((m) => `Build a project that uses ${m.skill.label} end-to-end.`),
+    };
   const text =
     `**${parsed.summary}**\n\n` +
     `**Top gaps to close:**\n` +
@@ -427,10 +451,22 @@ async function runRoadmap(
       },
     },
   );
-  const parsed = JSON.parse(raw) as {
-    overview: string;
-    weeks: { week: number; theme: string; deliverables: string[]; hours: number }[];
-  };
+  const parsed =
+    parseJsonSafe<{
+      overview: string;
+      weeks: { week: number; theme: string; deliverables: string[]; hours: number }[];
+    }>(raw) ?? {
+      overview: `${weeks}-week plan to close the top gaps for ${benchmark.title}.`,
+      weeks: Array.from({ length: weeks }, (_, i) => ({
+        week: i + 1,
+        theme: `Close gap ${i + 1}: ${fit.missing[i]?.skill.label ?? "core skill"}`,
+        deliverables: [
+          `Project using ${fit.missing[i]?.skill.label ?? "the target skill"}`,
+          `Read 1 in-depth guide on ${fit.missing[i]?.skill.label ?? "the topic"}`,
+        ],
+        hours: 10,
+      })),
+    };
   const text =
     `**${parsed.overview}**\n\n` +
     parsed.weeks
@@ -497,7 +533,19 @@ async function runCoverLetter(
       },
     },
   );
-  const parsed = JSON.parse(raw) as { subject: string; body: string };
+  const parsed =
+    parseJsonSafe<{ subject: string; body: string }>(raw) ?? {
+      subject: `Application — ${benchmark.title}${company ? ` at ${company}` : ""}`,
+      body:
+        `Dear Hiring Team,\n\n` +
+        `I'm writing to express my interest in the ${benchmark.title} role${company ? ` at ${company}` : ""}. ` +
+        `My background in ${fit.matched.slice(0, 3).map((m) => m.skill.label).join(", ")} ` +
+        `aligns well with the requirements you've outlined, and I'm excited about the opportunity to contribute.\n\n` +
+        `In my recent work I've applied these skills to deliver measurable outcomes, ` +
+        `and I'm confident I can do the same for your team.\n\n` +
+        `I'd welcome the chance to discuss how my experience fits your needs.\n\n` +
+        `Best regards`,
+    };
   // Sanity-check: if the model came back with a letter that ends mid-sentence
   // (no terminal punctuation, last word clipped) we surface a soft warning in
   // the persisted message so the UI can hint at a retry.

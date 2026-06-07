@@ -44,7 +44,13 @@ import {
   isRateLimitError,
   RetryableError,
 } from "@/lib/ai/resilience";
-import { pickModel, nextModel, type ModelTier } from "@/lib/ai/models";
+import {
+  pickModel,
+  nextModel,
+  bumpUsage,
+  markExhausted,
+  type ModelTier,
+} from "@/lib/ai/models";
 
 // ---------- Configuration ----------
 
@@ -270,23 +276,43 @@ async function runWithModelFallback(
   initial: { model: string; maxOutputTokens: number },
   tier: ModelTier,
 ): Promise<string> {
+  // Walk the full model pool: requested tier first, then the other tier.
+  // `nextModel` already does that fall-through; we just loop until either
+  // a call succeeds or the chain is empty.
   const tried = new Set<string>();
   let current = initial;
 
-  while (true) {
+  // Hard cap on the chain to avoid an infinite loop if nextModel is
+  // ever wrong. 4 models is the current max — 8 gives us two full walks.
+  for (let i = 0; i < 8; i++) {
+    if (tried.has(current.model)) {
+      // We looped. Something is wrong with the rotation; surface.
+      throw new Error(
+        `[ai/provider] model fallback loop on ${current.model}; aborting.`,
+      );
+    }
     tried.add(current.model);
     try {
-      return await runSingleChat(messages, options, current);
+      const out = await runSingleChat(messages, options, current);
+      // Only count successful calls. A model that 429s will be marked
+      // exhausted in the catch below, which sets its counter to the
+      // cap so subsequent calls in the same UTC day skip it.
+      bumpUsage(current.model);
+      return out;
     } catch (err) {
       // Only fall back to a different model on rate-limit / quota errors.
       // Non-rate-limit errors (schema parse, bad prompt, etc.) should
       // surface immediately so we don't paper over real bugs.
       if (!isRateLimitError(err)) throw err;
 
+      // Remember this model is spent for the rest of the UTC day so
+      // the next call in this process (or another route handler)
+      // doesn't burn more quota on it.
+      markExhausted(current.model);
+
       const fallback = nextModel(tier, current.model);
-      if (!fallback || tried.has(fallback.model)) {
-        // No more models in the tier to try, or we've already tried
-        // the fallback. Surface the original error.
+      if (!fallback) {
+        // Every model in both tiers is spent. Surface the original 429.
         throw err;
       }
       console.warn(
@@ -295,6 +321,10 @@ async function runWithModelFallback(
       current = fallback;
     }
   }
+  // Defensive — should never reach here.
+  throw new Error(
+    "[ai/provider] runWithModelFallback exhausted its 8-iteration budget.",
+  );
 }
 
 async function runSingleChat(
