@@ -497,7 +497,7 @@ flowchart LR
 3. **Prompt caching** for the chat system prompt; expected 30–40% token reduction.
 4. **JWT-claim RLS** once we have >5 tables with shared writes; currently service-role is fine.
 5. **Background sync** of `hunter_saved` job posts to detect status changes (e.g. "still open?").
-6. **In-app CV builder** — the original brief asks for it; it's the biggest single feature gap.
+6. **In-app CV builder** — the original brief asks for it.
 7. **AI nudges** — Inngest cron that emails a user who hasn't logged a todo in 3 days.
 
 ---
