@@ -32,6 +32,9 @@ yarn-error.log*
 # vercel
 .vercel
 
+# netlify
+.netlify/
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts
@@ -42,3 +45,39 @@ next-env.d.ts
 
 # clerk configuration (can include secrets)
 /.clerk/
+
+# ---------- local dev artefacts (do not commit) ----------
+
+# dev / eval / build log noise
+*.log
+.next-dev.err
+.next-dev.log
+.next-dev.out
+scripts/.next-dev.log
+scripts/build.log
+scripts/dev-eval.log
+scripts/dev-eval-stderr.log
+scripts/dev-eval-stdout.log
+scripts/eval-*.log
+scripts/seed-eval-cv-last.log
+scripts/seed.stdout.log
+evals/results-stderr.log
+evals/results-stdout.log
+evals/run.stdout.log
+
+# transient dev launcher scripts / state
+scripts/dev-eval.mjs
+scripts/dev-eval-detached.mjs
+scripts/dev-eval.pid
+scripts/run-evals.cmd
+scripts/start-dev.cmd
+scripts/probe-eval-parse.js
+scripts/inspect-saved.ts
+scripts/smoke-tavily.ts
+
+# untracked demo CV PDFs (DOCX versions live in evals/demo_cvs/)
+# Only ignore the bare root copies so a deliberate add still works
+/cv.pdf
+/cv1_*.pdf
+/cv2_*.pdf
+/cv3_*.pdf
