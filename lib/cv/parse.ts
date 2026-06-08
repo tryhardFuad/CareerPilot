@@ -1,7 +1,7 @@
-import { pathToFileURL } from "node:url";
-import { createRequire } from "node:module";
 import { PDFParse } from "pdf-parse";
 import mammoth from "mammoth";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 /**
  * Parse a CV file (PDF or DOCX) into raw plain text.
@@ -14,9 +14,9 @@ import mammoth from "mammoth";
  *         those line breaks, which left the chunker with a single
  *         long string and no detectable section boundaries.
  *         (This module is `runtime = "nodejs"`, so the v2 class
- *         which uses pdfjs under the hood is fine — see
+ *         which uses pdfjs under the hood is fine - see
  *         `next.config.ts`.)
- * - DOCX: `mammoth.extractRawText` → plain text. DOCX is a ZIP of
+ * - DOCX: `mammoth.extractRawText` -> plain text. DOCX is a ZIP of
  *         XML, so the result is already UTF-8.
  *
  * Throws on:
@@ -26,48 +26,53 @@ import mammoth from "mammoth";
  */
 
 // pdf-parse v2 uses pdfjs-dist under the hood. In Node.js, pdfjs's
-// fake-worker bootstrap still tries to `import(this.workerSrc)` and
-// throws "Setting up fake worker failed: Cannot find module
-// './pdf.worker.mjs'" if workerSrc is left as its relative default —
+// fake-worker bootstrap tries to `import(this.workerSrc)` and throws
+// "Setting up fake worker failed: Cannot find module
+// './pdf.worker.mjs'" if workerSrc is left as its relative default -
 // because in a Next.js server bundle there is no `pdf.worker.mjs`
-// sitting next to the chunk. We resolve the worker file from the
-// installed `pdfjs-dist` package and point pdfjs at it via a
-// `file://` URL. This is the supported setup; pdfjs then runs the
-// worker module on the main thread (it's all in the same Node
-// process anyway, so there's no perf cost for a one-shot CV parse).
+// sitting next to the chunk. We need the absolute file:// URL of the
+// installed worker.
 //
-// We do this lazily on the first call rather than at module-import
-// time, because (a) we want to avoid the resolution cost in any
-// route that imports `parseCv` but never parses a PDF, and (b) we
-// also need the `pdf-parse` ESM module to be loaded by the time
-// `PDFParse.setWorker` is invoked, which only happens once the class
-// has been imported and used at least once.
+// Why this is awkward: `pdfjs-dist` is an ESM-only package
+// (`serverExternalPackages: ["pdf-parse", "pdfjs-dist"]` in
+// `next.config.ts`), and the subpath `legacy/build/pdf.worker.mjs`
+// is not declared in its `exports` field. That rules out:
+//   - `import "pdfjs-dist/legacy/build/pdf.worker.mjs"` ->
+//     "Module not found: ESM packages need to be imported" from
+//     webpack's `importESMExternals` plugin.
+//   - `import workerUrl from "...?url"` -> "does not contain a
+//     default export" because the file is a real ESM module, not
+//     an asset.
+//   - `import.meta.resolve(...)` -> "Accessing import.meta
+//     directly is unsupported"; webpack rewrites the call to
+//     `undefined(...)` in the bundle and it throws at runtime.
+//   - `new Function("return import.meta.resolve(...)")` -> classic-
+//     script context, `import.meta` is undefined.
+//   - `createRequire(import.meta.url).resolve(...)` -> same ESM-
+//     externals error as the static `import`.
+//
+// What DOES work: build the absolute path at runtime with
+// `path.join(process.cwd(), "node_modules", ...)` and convert to a
+// `file://` URL. Webpack's static analyzer can't follow
+// `process.cwd()` so it never flags the subpath. At runtime the
+// function's CWD is the project root where `node_modules/` lives,
+// so the path resolves correctly.
 let workerConfigured = false;
+function resolveWorkerUrl(): string {
+  const workerPath = join(
+    process.cwd(),
+    "node_modules",
+    "pdfjs-dist",
+    "legacy",
+    "build",
+    "pdf.worker.mjs",
+  );
+  return pathToFileURL(workerPath).href;
+}
+
 function ensureWorkerConfigured(): void {
   if (workerConfigured) return;
-  // Build the worker subpath from string segments instead of writing
-  // it as a literal, so webpack/Turbopack can't see the
-  // `pdfjs-dist/legacy/build/pdf.worker.mjs` substring in the source
-  // and try to bundle/resolve it at build time. At runtime the
-  // result is identical.
-  const pkg = ["pdfjs", "dist"].join("-");
-  const workerSubpath = ["legacy", "build", "pdf.worker.mjs"].join("/");
-  const workerSpec = `${pkg}/${workerSubpath}`;
-  // `createRequire` lets us resolve through the package's own
-  // `node_modules` graph, which is the most reliable way to find
-  // the worker file from an ESM context (and survives Next's
-  // bundling, since the literal `workerSpec` is never visible to
-  // the static analyzer).
-  const requireFromHere = createRequire(import.meta.url);
-  let workerPath: string;
-  try {
-    workerPath = requireFromHere.resolve(workerSpec);
-  } catch {
-    // Fallback for CJS contexts (no `import.meta.url`).
-    workerPath = require.resolve(workerSpec);
-  }
-  const workerUrl = pathToFileURL(workerPath).href;
-  PDFParse.setWorker(workerUrl);
+  PDFParse.setWorker(resolveWorkerUrl());
   workerConfigured = true;
 }
 
