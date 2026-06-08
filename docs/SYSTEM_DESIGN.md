@@ -32,7 +32,7 @@ flowchart LR
     UI[Next 15 RSC + client components]
   end
 
-  subgraph "Next.js 15 (Netlify)"
+  subgraph "Next.js 15 (Vercel)"
     MW[middleware.ts: Clerk protect]
     Pages[app/(dashboard)/* pages]
     API[app/api/* route handlers]
@@ -293,7 +293,7 @@ sequenceDiagram
   API-->>U: {cvId, ingestStatus: 'ready', chunkCount}
 ```
 
-**Bounded by 26 s** (Netlify function timeout for this route). On 1k tokens/second parse, 100 chunks × 3072 dims ≈ 1.2 MB of vector data — comfortably under 5 s on a warm connection.
+**Bounded by 60 s** (Vercel Hobby serverless function timeout for the default Node.js runtime — configurable up to 300 s on Pro). On 1k tokens/second parse, 100 chunks × 3072 dims ≈ 1.2 MB of vector data — comfortably under 5 s on a warm connection.
 
 ### 4.2 Assistant turn
 
@@ -388,9 +388,9 @@ The score is **programmatic and auditable**; Gemini is only used to normalise sk
 | **Inngest** | ✅ | Adds an external service for a flow that runs in <26 s sync; we'd still need the timeout escape hatch. |
 | **pg_cron** | ✅ | Couples ingestion to a polling loop we don't need; harder to surface failures to the user. |
 | **Supabase Edge Functions + webhooks** | ✅ | Two failure domains (upload → queue → worker) for a 5-step pipeline is over-engineering. |
-| **Sync inside the route** | ✅ *(chosen)* | One failure domain, easy error reporting (`ingest_status: 'failed'`), bounded by 26 s. |
+| **Sync inside the route** | ✅ *(chosen)* | One failure domain, easy error reporting (`ingest_status: 'failed'`), bounded by Vercel's 60 s Hobby function timeout. |
 
-If parse time ever exceeds the 26 s Netlify limit (e.g. 100-page PDFs), we'll move to Inngest; the migration is small because ingestion is already a pure function in `lib/cv/*`.
+If parse time ever exceeds the Vercel 60 s Hobby limit (e.g. 100-page PDFs), we'll move to Inngest; the migration is small because ingestion is already a pure function in `lib/cv/*`.
 
 ---
 
@@ -413,7 +413,7 @@ If parse time ever exceeds the 26 s Netlify limit (e.g. 100-page PDFs), we'll mo
 | CV upload (3k/day cold) | 3k | parse + 50 embeds | \$0.005 | **\$15.00** |
 | **Subtotal compute** | | | | **\$34.02 / day** |
 | Supabase (Pro plan, ~10 GB vectors) | | | | **\$25 / day (≈)** |
-| Netlify (Pro, 1M function invocations) | | | | **\$5 / day** |
+| Vercel (Hobby is $0; Pro = \$20/mo per member) | | | | **\$0 / day** |
 | **Total** | | | | **\$64 / day** |
 
 **Per active user / month ≈ \$2.10.** If we drop the heavy CV upload to a weekly cadence and cache the chat prompt, this halves. The target **\$0.10/user/month** requires either (a) bringing the LLM cost down with a smaller model for chat, or (b) aggressive prompt caching. Both are tractable and on the roadmap.
@@ -453,7 +453,7 @@ If parse time ever exceeds the 26 s Netlify limit (e.g. 100-page PDFs), we'll mo
 - **Authz.** Every Supabase query is filtered by `user_id` server-side. The service-role client is **only** instantiated in `lib/supabase/admin.ts`; no other file may import `@supabase/supabase-js` directly (ESLint rule, to be added).
 - **PII handling.** CVs are stored in a private bucket; downloads use signed URLs minted on-demand. The `cv_chunks.content` field is encrypted at rest by Supabase.
 - **Prompt injection.** The Hunter prompt takes user-supplied `targetRole` and the user's CV; both are pre-truncated and the response is JSON-validated before being returned. We do **not** echo raw JD content into the UI without HTML escaping.
-- **No secrets in repo.** `.env.local` is gitignored; Netlify env vars are set in the dashboard.
+- **No secrets in repo.** `.env.local` is gitignored; Vercel env vars are set in the dashboard (Project → Settings → Environment Variables).
 - **Dependency hygiene.** `npm audit` runs in CI; we pin to caret majors to catch minor updates.
 - RLS IS NOT ENABLED
 
@@ -463,7 +463,7 @@ If parse time ever exceeds the 26 s Netlify limit (e.g. 100-page PDFs), we'll mo
 
 | Signal | Source | Where |
 |---|---|---|
-| API latency (p50/p95) | Netlify function logs | Netlify dashboard → Functions |
+| API latency (p50/p95) | Vercel function logs | Vercel dashboard → Logs (or `vercel logs <deployment-url>`) |
 | LLM error rate | `lib/ai/resilience.ts` counter | Console logs (to be piped to a Tigris/Otel exporter) |
 | `ingest_status='failed'` rows | Postgres | A nightly SQL job (manual for now) |
 | Fit-score distribution | Postgres | `select histogram(score)` in `evals/` |
@@ -475,23 +475,25 @@ If parse time ever exceeds the 26 s Netlify limit (e.g. 100-page PDFs), we'll mo
 
 ```mermaid
 flowchart LR
-  GH[GitHub main] --> Netlify[Netlify build]
-  Netlify --> FN[Next.js serverless functions]
+  GH[GitHub main] --> Vercel[Vercel build]
+  Vercel --> FN[Next.js serverless functions<br/>Node 20 runtime]
   FN --> SB[(Supabase managed Postgres)]
   FN --> Storage[(Supabase Storage)]
   FN --> Gemini
-  User -->|HTTPS| Netlify
+  User -->|HTTPS| Vercel
 ```
 
-- `netlify.toml` pins Node 20, uses `@netlify/plugin-nextjs`, and gives `/api/cv/upload` a 26 s function timeout.
+- **Vercel is zero-config for Next.js 15** — no `vercel.json` is required. The platform auto-detects the App Router, uses the Node 20 runtime, and externalizes the packages listed in `next.config.ts` → `serverExternalPackages` (which keeps `pdf-parse` + `pdfjs-dist` out of the webpack bundle so the worker path resolves correctly).
+- The default Hobby function timeout is **60 s** (configurable up to 300 s on Pro). `/api/cv/upload` finishes well inside that on a warm connection (≈ 5 s for 100 chunks).
 - Migrations are applied with `npx supabase db push` from CI on a tag.
-- Rollback: Netlify "restore deploy" + Supabase point-in-time recovery (Pro plan).
+- Rollback: Vercel "Promote previous deployment" on the Deployments tab + Supabase point-in-time recovery (Pro plan).
+- Environment variables live in the Vercel dashboard (Project → Settings → Environment Variables), scoped to **Production** and **Preview**.
 
 ---
 
 ## 12. Future work
 
-1. **Inngest** for long-tail CV ingestion (>26 s).
+1. **Inngest** for long-tail CV ingestion (>60 s on Vercel Hobby).
 2. **HNSW** index when the corpus crosses 500k chunks.
 3. **Prompt caching** for the chat system prompt; expected 30–40% token reduction.
 4. **JWT-claim RLS** once we have >5 tables with shared writes; currently service-role is fine.

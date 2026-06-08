@@ -32,7 +32,7 @@ The RAG layer is the single source of truth: the assistant cites chunks, the fit
 
 ## Live demo
 
-> 🚧 Pending deploy — see [`docs/SYSTEM_DESIGN.md`](docs/SYSTEM_DESIGN.md) § *Deployment* for the architecture and the Netlify plan.
+> 🚧 Pending deploy — Vercel is the chosen target (zero-config Next.js 15, free Hobby tier). See [`docs/SYSTEM_DESIGN.md`](docs/SYSTEM_DESIGN.md) § *Deployment* for the full plan.
 
 ---
 
@@ -44,7 +44,7 @@ The RAG layer is the single source of truth: the assistant cites chunks, the fit
               └────────────┬───────────────────────────────────────────┘
                            │  Clerk session
                            ▼
-   ┌───────────── Next.js 15 App Router (Vercel/Netlify) ─────────────┐
+   ┌───────────── Next.js 15 App Router (Vercel) ─────────────────────┐
    │                                                                   │
    │   app/(dashboard)  ──  cv  ──  hunter  ──  chat  ──  fit-score    │
    │                              │       │          │                 │
@@ -75,7 +75,7 @@ Full system design, data model, scale-out math, and failure modes: [`docs/SYSTEM
 
 | Layer | Choice | Why |
 |---|---|---|
-| **Framework** | Next.js 15.5 (App Router, RSC, Turbopack) | Single repo for UI + API, server actions cut latency, Netlify/Vercel deploy |
+| **Framework** | Next.js 15.5 (App Router, RSC, Turbopack) | Single repo for UI + API, server actions cut latency, deployed to Vercel |
 | **UI** | React 19, Tailwind CSS 3.4, lucide-react | Server components + a tight custom design system (`brand-dna.md`) |
 | **Auth** | Clerk | Email + OAuth, session cookies for the Supabase server client |
 | **Database** | Supabase Postgres + pgvector | One service for relational data, vectors, and file storage |
@@ -83,7 +83,7 @@ Full system design, data model, scale-out math, and failure modes: [`docs/SYSTEM
 | **LLM** | Gemini 3 Flash + Pro (rotated), Gemini Embedding 2 | 3072-dim embeddings, Flash for most calls, Pro for cover letters |
 | **Job sources** | Adzuna · Arbeitnow · RemoteOK · The Muse · Tavily (web search) | 4 free / low-cost boards + 1 web search, all live, deduped on (title, company) |
 | **Type safety** | TypeScript strict | All API routes typed end-to-end |
-| **Hosting** | Netlify (Netlify Next.js plugin) | `@netlify/plugin-nextjs`; `/api/cv/upload` runs in 26 s (sync parse) |
+| **Hosting** | Vercel (Hobby) | Zero-config Next.js 15; `next.config.ts` externalizes `pdf-parse` + `pdfjs-dist` so the worker path resolves on serverless |
 
 ---
 
@@ -214,7 +214,7 @@ See [`structure.md`](structure.md) for the full annotated tree. Highlights:
 | `TAVILY_API_KEY` | ✅ | Tavily web search for Hunter |
 | `ADZUNA_APP_ID` / `ADZUNA_APP_KEY` | ✅ | Adzuna job board |
 
-Never commit `.env.local`. Netlify environment variables are set in the Netlify dashboard.
+Never commit `.env.local`. Vercel environment variables are set in the Vercel dashboard (Project → Settings → Environment Variables) — copy each row above into **Production**, **Preview**, and optionally **Development**.
 
 ---
 
