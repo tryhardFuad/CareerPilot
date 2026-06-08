@@ -5,7 +5,6 @@
 **An agentic career co-pilot that turns your CV into a living, search-and-apply job search engine.**
 
 Built for the Codesprint Poridhi hackathon (June 2026).
-Category: Agentic / AI · Theme: Career acceleration
 
 </div>
 
