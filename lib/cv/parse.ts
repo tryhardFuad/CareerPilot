@@ -50,6 +50,13 @@ function ensureWorkerConfigured(): void {
   // `pdfjs-dist/legacy/build/pdf.worker.mjs` substring in the source
   // and try to bundle/resolve it at build time. At runtime the
   // result is identical.
+  //
+  // For the Vercel deployment trace we don't need the path to be
+  // visible in source: `next.config.ts` declares an
+  // `outputFileTracingIncludes` entry that glob-matches the file
+  // by path and force-includes it in the trace. That is a separate
+  // step from bundling and runs on the resolved file, not the
+  // source string.
   const pkg = ["pdfjs", "dist"].join("-");
   const workerSubpath = ["legacy", "build", "pdf.worker.mjs"].join("/");
   const workerSpec = `${pkg}/${workerSubpath}`;

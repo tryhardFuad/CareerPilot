@@ -14,6 +14,16 @@ const nextConfig: NextConfig = {
   // to a `file://` URL of the installed worker, but we still need
   // Turbopack to leave the packages alone so that override wins.
   serverExternalPackages: ["pdf-parse", "pdfjs-dist"],
+  // Vercel's output trace is the source of truth for which files end
+  // up in the deployed function bundle. The pdfjs legacy worker is
+  // referenced at runtime via `createRequire(...).resolve(...)`, so
+  // the static graph doesn't see it; without this include, Vercel
+  // prunes `pdfjs-dist/legacy/build/pdf.worker.mjs` and the first
+  // PDF parse fails with "Cannot find module './pdf.worker.mjs'".
+  // Glob is relative to the repo root.
+  outputFileTracingIncludes: {
+    "/api/cv/upload": ["./node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs"],
+  },
 };
 
 export default nextConfig;
